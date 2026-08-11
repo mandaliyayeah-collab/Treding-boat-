@@ -3,7 +3,6 @@ import hmac
 import hashlib
 import json
 import requests
-import yfinance as yf
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
@@ -14,6 +13,16 @@ BASE_URL = "https://cdn.testnet.delta.exchange"
 def generate_signature(method, endpoint, payload, timestamp):
     message = method + timestamp + endpoint + payload
     return hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
+
+def get_delta_candles():
+    url = f"{BASE_URL}/v2/chart/candles?resolution=1h&symbol=BTCUSD"
+    res = requests.get(url).json()
+    if 'result' in res and res['result']:
+        df = pd.DataFrame(res['result'])
+        df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        return df
+    return None
 
 def place_order():
     endpoint = "/v2/orders"
@@ -41,28 +50,33 @@ print("Delta Demo Bot Starting...", flush=True)
 while True:
     try:
         print("Checking AI signal...", flush=True)
-        data = yf.download("BTC-USD", start="2023-01-01", progress=False)
-        data['Return'] = data['Close'].pct_change()
-        data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-        data.dropna(inplace=True)
+        data = get_delta_candles()
+        
+        if data is not None and len(data) > 30:
+            data['Return'] = data['Close'].pct_change()
+            data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)
+            data.dropna(inplace=True)
 
-        X = data[['Open', 'High', 'Low', 'Close', 'Volume', 'Return']]
-        y = data['Target']
+            X = data[['Open', 'High', 'Low', 'Close', 'Volume', 'Return']]
+            y = data['Target']
 
-        model = RandomForestClassifier(n_estimators=50, random_state=42)
-        model.fit(X[:-30], y[:-30])
+            model = RandomForestClassifier(n_estimators=50, random_state=42)
+            model.fit(X[:-5], y[:-5])
 
-        latest_data = X.tail(1)
-        prediction = model.predict(latest_data)
+            latest_data = X.tail(1)
+            prediction = model.predict(latest_data)
 
-        if prediction[0] == 1:
-            print("AI Signal: BUY -> Placing Demo Order...", flush=True)
-            res = place_order()
-            print("Delta API Response:", res, flush=True)
+            if prediction[0] == 1:
+                print("AI Signal: BUY -> Placing Demo Order...", flush=True)
+                res = place_order()
+                print("Delta API Response:", res, flush=True)
+            else:
+                print("AI Signal: NO TRADE / HOLD", flush=True)
         else:
-            print("AI Signal: NO TRADE / HOLD", flush=True)
+            print("Failed to fetch candles from Delta", flush=True)
+
     except Exception as e:
         print("Bot Error:", e, flush=True)
 
     time.sleep(300)
-        
+            
