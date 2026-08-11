@@ -1,48 +1,84 @@
 import time
-from delta_rest_client import DeltaRestClient
+import hmac
+import hashlib
+import json
+import requests
+import threading
+from flask import Flask
 import yfinance as yf
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 
-# ૧. Demo / Testnet API Credentials
+# ૧. Render માટે Flask વેબ સર્વર
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Delta Demo Bot is Active!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=10000)
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# ૨. Demo Credentials & Config
 API_KEY = "KjHXEE687nqKhybHjZXmVZDkhLIrt"
 API_SECRET = "Ti4ogJpiLP4KjhTJI5zytLCEd1Xz25NnCHlEp9z2u7PRYxspZCN4XaNI9Eia"
+BASE_URL = "https://cdn.testnet.delta.exchange"
 
-# Demo Testnet URL કનેક્ટ કરી રહ્યા છીએ
-delta_client = DeltaRestClient(
-    base_url='https://cdn.testnet.delta.exchange',
-    api_key=API_KEY,
-    api_secret=API_SECRET
-)
+def generate_signature(method, endpoint, payload, timestamp):
+    message = method + timestamp + endpoint + payload
+    return hmac.new(API_SECRET.encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
 
-# ૨. AI મોડેલ ટ્રેનિંગ (BTC-USD)
-data = yf.download("BTC-USD", start="2023-01-01")
-data['Return'] = data['Close'].pct_change()
-data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-data.dropna(inplace=True)
-
-X = data[['Open', 'High', 'Low', 'Close', 'Volume', 'Return']]
-y = data['Target']
-
-model = RandomForestClassifier(n_estimators=50, random_state=42)
-model.fit(X[:-30], y[:-30])
-
-latest_data = X.tail(1)
-prediction = model.predict(latest_data)
-
-# ૩. Demo Delta પર ઓર્ડર એક્ઝિક્યુટ કરવો
-if prediction[0] == 1:
-    print("AI Signal: BUY -> Placing Order on Demo Delta Exchange...")
-    try:
-        response = delta_client.place_order(
-            product_id=27,            # BTCUSD Futures
-            size=1,                   # Demo Order Quantity
-            side='buy',
-            order_type='market_order'
-        )
-        print("Demo Order Response:", response)
-    except Exception as e:
-        print("Order Error:", e)
-else:
-    print("AI Signal: NO TRADE / HOLD")
+def place_order():
+    endpoint = "/v2/orders"
+    timestamp = str(int(time.time()))
+    payload = json.dumps({
+        "product_id": 27,
+        "size": 1,
+        "side": "buy",
+        "order_type": "market_order"
+    })
     
+    signature = generate_signature("POST", endpoint, payload, timestamp)
+    headers = {
+        "api-key": API_KEY,
+        "signature": signature,
+        "timestamp": timestamp,
+        "Content-Type": "application/json"
+    }
+    
+    response = requests.post(BASE_URL + endpoint, data=payload, headers=headers)
+    return response.json()
+
+# ૩. AI મોડેલ લૂપ
+def run_bot():
+    while True:
+        try:
+            print("Checking AI signal...")
+            data = yf.download("BTC-USD", start="2023-01-01", progress=False)
+            data['Return'] = data['Close'].pct_change()
+            data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)
+            data.dropna(inplace=True)
+
+            X = data[['Open', 'High', 'Low', 'Close', 'Volume', 'Return']]
+            y = data['Target']
+
+            model = RandomForestClassifier(n_estimators=50, random_state=42)
+            model.fit(X[:-30], y[:-30])
+
+            latest_data = X.tail(1)
+            prediction = model.predict(latest_data)
+
+            if prediction[0] == 1:
+                print("AI Signal: BUY -> Placing Demo Order...")
+                res = place_order()
+                print("Delta API Response:", res)
+            else:
+                print("AI Signal: NO TRADE / HOLD")
+        except Exception as e:
+            print("Bot Error:", e)
+
+        time.sleep(300)
+
+threading.Thread(target=run_bot, daemon=True).start()
