@@ -1,6 +1,5 @@
-delta-rest-client
+flask
 yfinance
 pandas
 scikit-learn
 requests
-
