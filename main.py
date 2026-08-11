@@ -9,7 +9,8 @@ from sklearn.ensemble import RandomForestClassifier
 
 API_KEY = "KjHXEE687nqKhybHjZXmVZDkhLIrt"
 API_SECRET = "Ti4ogJpiLP4KjhTJI5zytLCEd1Xz25NnCHlEp9z2u7PRYxspZCN4XaNI9Eia"
-BASE_URL = "BASE_URL = "https://testnet-api.delta.exchange"  # ✅ આ સાચું છે
+BASE_URL = "BASE_URL = "https://testnet-api.delta.exchange"
+
 
 
 def generate_signature(method, endpoint, payload, timestamp):
