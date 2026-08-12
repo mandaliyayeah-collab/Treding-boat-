@@ -13,7 +13,7 @@ from sklearn.ensemble import RandomForestClassifier
 app = Flask(__name__)
 
 # ============================================================
-# DELTA EXCHANGE TESTNET CONFIGURATION
+# CONFIGURATION
 # ============================================================
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 TRADING_URL = "https://testnet-api.delta.exchange"
@@ -21,9 +21,22 @@ TRADING_URL = "https://testnet-api.delta.exchange"
 SYMBOL = "BTCUSD"
 RESOLUTION = "1h"
 
-# API Keys from Screenshot
 API_KEY = "3XVMBQOHeYoxaMEa863eJDxdt15XKp"
 API_SECRET = "5Heph59t27suDj0jqUd18Mb8uoAv5OCB2yDC5FrhvLO7bNPpmyiANHIdJ8Cy"
+
+# ============================================================
+# GET PRODUCT ID DYNAMICALLY
+# ============================================================
+def get_product_id():
+    try:
+        res = requests.get(f"{TRADING_URL}/v2/products", timeout=10).json()
+        if res.get("success"):
+            for prod in res.get("result", []):
+                if prod.get("symbol") == SYMBOL:
+                    return prod.get("id")
+    except Exception as e:
+        print(f"Error fetching Product ID: {e}")
+    return 1  # Default fallback
 
 # ============================================================
 # SIGNATURE GENERATOR
@@ -56,7 +69,7 @@ def get_candles():
 
     candles = data.get("result", [])
     if not candles:
-        raise Exception("No candle data received from Delta Exchange")
+        raise Exception("No candle data received")
 
     df = pd.DataFrame(candles)
 
@@ -102,7 +115,7 @@ def make_prediction():
     features = ["rsi", "sma_10", "sma_20", "ema_10", "ema_20", "return", "volatility"]
 
     if len(df) < 100:
-        raise Exception(f"Not enough data for ML. Only {len(df)} rows available.")
+        raise Exception(f"Not enough data: {len(df)} rows.")
 
     train_df = df.iloc[:-1].copy()
     X = train_df[features]
@@ -131,18 +144,20 @@ def make_prediction():
     }
 
 # ============================================================
-# PLACE ORDER ON DELTA TESTNET
+# PLACE MARKET ORDER ON DELTA
 # ============================================================
-def place_order(side, price):
+def place_order(side):
+    product_id = get_product_id()
     endpoint = "/v2/orders"
     timestamp = str(int(time.time()))
+    
     payload = {
-        "product_id": 1,
+        "product_id": product_id,
         "size": 1,
         "side": side.lower(),
-        "order_type": "limit_order",
-        "limit_price": str(price)
+        "order_type": "market_order"
     }
+    
     payload_str = json.dumps(payload)
     signature = generate_signature("POST", endpoint, payload_str, timestamp)
 
@@ -157,40 +172,36 @@ def place_order(side, price):
     return res.json()
 
 # ============================================================
-# AUTOMATED BACKGROUND TRADING LOOP (Runs every 30 Mins)
+# BACKGROUND AUTO-TRADER (Every 10 Mins)
 # ============================================================
 def auto_trading_bot():
-    print("Auto-Trading Bot Loop Started...")
+    print("Auto-Trader running...")
     while True:
         try:
             pred = make_prediction()
-            print(f"Checking Market: Signal={pred['signal']}, Price={pred['price']}, RSI={pred['rsi']}")
-            # Execute Order if confidence is strong
-            if pred['probability_up'] > 60 or pred['probability_down'] > 60:
-                res = place_order(pred['signal'], pred['price'])
-                print("Auto-Trade Placed Response:", res)
+            print(f"Checking: {pred['signal']}, Up: {pred['probability_up']}%, Down: {pred['probability_down']}%")
+            
+            # 55% કન્ફિડન્સ પર ઓર્ડર મુકાશે
+            if pred['probability_up'] >= 55 or pred['probability_down'] >= 55:
+                res = place_order(pred['signal'])
+                print("Market Order Placed Response:", res)
         except Exception as e:
-            print(f"Auto-Trade Loop Error: {e}")
-        time.sleep(1800)
+            print(f"Auto-Trader Error: {e}")
+        time.sleep(600)  # દર ૧૦ મિનિટે ચેક કરશે
 
 threading.Thread(target=auto_trading_bot, daemon=True).start()
 
 # ============================================================
-# FLASK WEB ENDPOINTS
+# ROUTES
 # ============================================================
 @app.route("/")
 def home():
-    return jsonify({
-        "status": "running",
-        "message": "Delta Exchange ML API & Auto-Bot active",
-        "symbol": SYMBOL
-    })
+    return jsonify({"status": "running", "message": "Delta Exchange Auto-Trader Active"})
 
 @app.route("/predict")
 def predict():
     try:
-        result = make_prediction()
-        return jsonify({"success": True, "data": result})
+        return jsonify({"success": True, "data": make_prediction()})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -198,7 +209,7 @@ def predict():
 def execute_trade_endpoint():
     try:
         pred = make_prediction()
-        res = place_order(pred['signal'], pred['price'])
+        res = place_order(pred['signal'])
         return jsonify({"success": True, "prediction": pred, "order_response": res})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
