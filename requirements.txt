@@ -1,5 +1,4 @@
-flask
-yfinance
-pandas
-scikit-learn
 requests
+pandas
+numpy
+scikit-learn
