@@ -18,7 +18,7 @@ API_SECRET = os.environ.get("DELTA_API_SECRET", "UhGk2EPyyRxtPW1JLAMMdtjCU4wGnbd
 
 SYMBOL = "BTCUSD"
 CONFIDENCE_THRESHOLD = 0.55  # 55% Confidence Requirement
-RISK_PER_TRADE_PERCENT = 0.05  # 5% of available balance per trade (Auto-Compounding)
+RISK_PER_TRADE_PERCENT = 0.05  # 5% of available balance per trade
 LEVERAGE = 3  # Safe 3x Leverage
 
 def generate_signature(secret, method, path, query="", payload=""):
@@ -40,7 +40,7 @@ def get_headers(method, path, query="", payload=""):
         "Content-Type": "application/json"
     }
 
-# 1. Fetch live balance for automatic compounding
+# 1. Fetch live balance
 def get_available_balance():
     try:
         path = "/v2/wallet/balances"
@@ -50,11 +50,12 @@ def get_available_balance():
         if data.get("success"):
             for item in data.get("result", []):
                 if item.get("asset_symbol") in ["USDT", "USD"]:
-                    return float(item.get("available_balance", 0))
-        return 50.0
+                    bal = float(item.get("available_balance", 0.0))
+                    return bal
+        return 0.0
     except Exception as e:
-        print(f"Balance fetch error: {e}")
-        return 50.0
+        print(f"[ERROR] Balance fetch error: {e}")
+        return 0.0
 
 # 2. Fetch live candles
 def fetch_market_data():
@@ -63,6 +64,7 @@ def fetch_market_data():
         res = requests.get(BASE_URL + path, timeout=10)
         candles = res.json().get("result", [])
         if not candles:
+            print("[ERROR] No candle data received from Delta Exchange.")
             return None
         
         df = pd.DataFrame(candles)
@@ -73,12 +75,13 @@ def fetch_market_data():
         df['volume'] = df['volume'].astype(float)
         return df
     except Exception as e:
-        print(f"Data fetch error: {e}")
+        print(f"[ERROR] Market data fetch error: {e}")
         return None
 
 # 3. AI prediction model
 def predict_signal(df):
     if df is None or len(df) < 50:
+        print(f"[AI MODEL] અપૂરતો ડેટા (કેન્ડલ્સ: {len(df) if df is not None else 0}). સિગ્નલ સ્કીપ કર્યો.")
         return "HOLD", 0.0
 
     df['return'] = df['close'].pct_change()
@@ -98,7 +101,9 @@ def predict_signal(df):
     latest_features = df_clean[features].iloc[[-1]]
     probabilities = model.predict_proba(latest_features)[0]
     
-    prob_down, prob_up = probabilities[0], probabilities[1]
+    prob_down, prob_up = float(probabilities[0]), float(probabilities[1])
+    
+    print(f"[AI CALCULATION] Up Probability: {prob_up*100:.2f}% | Down Probability: {prob_down*100:.2f}%")
     
     if prob_up >= CONFIDENCE_THRESHOLD:
         return "BUY", prob_up
@@ -121,34 +126,53 @@ def place_order(action, size):
         res = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
         return res.json()
     except Exception as e:
-        print(f"Order error: {e}")
+        print(f"[ERROR] Order execution error: {e}")
         return {"error": str(e)}
 
 # 5. Endpoint triggered by cron-job.org
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
+    print("\n================= [નવો ટ્રેડિંગ સાયકલ શરૂ] =================")
     df = fetch_market_data()
     action, confidence = predict_signal(df)
+    balance = get_available_balance()
+    
+    print(f"[LIVE STATUS] Balance: ${balance:.2f} | AI Decision: {action} ({confidence * 100:.2f}%)")
     
     if action in ["BUY", "SELL"]:
-        balance = get_available_balance()
+        if balance <= 0:
+            print("[ALERT] AI સિગ્નલ મળ્યો, પરંતુ એકાઉન્ટમાં બેલેન્સ ($0) હોવાથી ટ્રેડ કેન્સલ થયો.")
+            return jsonify({
+                "status": "FAILED_NO_BALANCE",
+                "action": action,
+                "confidence": f"{confidence * 100:.2f}%",
+                "balance": f"${balance:.2f}",
+                "message": "Delta Exchange એકાઉન્ટમાં બેલેન્સ નથી."
+            }), 200
+            
         trade_margin = balance * RISK_PER_TRADE_PERCENT
         contracts = max(1, int(trade_margin * LEVERAGE))
         
+        print(f"[EXECUTING] {action} ઓર્ડર મૂકી રહ્યા છીએ: {contracts} contracts...")
         order_res = place_order(action, contracts)
+        print(f"[ORDER RESPONSE] {order_res}")
+        
         return jsonify({
             "status": "ORDER_PLACED",
             "action": action,
             "confidence": f"{confidence * 100:.2f}%",
             "contracts": contracts,
+            "balance": f"${balance:.2f}",
             "order_response": order_res
         }), 200
     
+    print(f"[WAIT] કન્ફિડન્સ ૫૫% કરતાં ઓછો છે ({confidence * 100:.2f}%). આગલી કેન્ડલની રાહ જુઓ.")
     return jsonify({
         "status": "WAIT_AND_SEE",
         "reason": "Market conditions not matching 55%+ threshold",
         "action": action,
-        "confidence": f"{confidence * 100:.2f}%"
+        "confidence": f"{confidence * 100:.2f}%",
+        "balance": f"${balance:.2f}"
     }), 200
 
 if __name__ == "__main__":
