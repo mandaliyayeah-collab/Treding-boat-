@@ -227,7 +227,8 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
-# --- 6. ENDPOINT TRIGGER ---
+# --- 6. ENDPOINTS (HOME & EXECUTE-TRADE) ---
+@app.route("/", methods=["GET"])
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
     print("\n================= [AI & WHALE TRACKER START] =================")
@@ -243,7 +244,7 @@ def execute_trade():
     
     if action in ["BUY", "SELL"]:
         if balance <= 0:
-            print("[ABORT] Cancelled: Wallet Balance $0 che.")
+            print("[ABORT] Cancelled: Wallet Balance $0 hai.")
             return jsonify({
                 "status": "FAILED_NO_BALANCE",
                 "strategy": strategy_tag,
@@ -281,4 +282,4 @@ def execute_trade():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
+            
