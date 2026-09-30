@@ -77,7 +77,7 @@ def get_available_balance():
 
 def fetch_market_data():
     try:
-        path = f"/v2/chart/history?symbol={SYMBOL}&resolution=5"
+        path = f"/v2/chart/history?symbol={SYMBOL}&resolution=15"
         res = requests.get(BASE_URL + path, timeout=10)
         candles = res.json().get("result", [])
         if not candles:
@@ -92,42 +92,78 @@ def fetch_market_data():
         return None
 
 def add_indicators(df):
-    # Moving Averages
     df['ma7'] = df['close'].rolling(7).mean()
     df['ma25'] = df['close'].rolling(25).mean()
     df['return'] = df['close'].pct_change()
     
-    # ATR (Average True Range - Volatility)
+    # ATR (Volatility)
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean()
     
-    # RSI (Relative Strength Index)
+    # RSI
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # Target definition (Next candle movement)
+    # --- WHALE & LIQUIDITY SWEEP FEATURES ---
+    candle_range = (df['high'] - df['low']).replace(0, 1e-9)
+    df['lower_wick_ratio'] = (df[['open', 'close']].min(axis=1) - df['low']) / candle_range
+    df['upper_wick_ratio'] = (df['high'] - df[['open', 'close']].max(axis=1)) / candle_range
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    df['vol_surge'] = df['volume'] / (df['vol_ma20'] + 1e-9)
+    
+    # 20-period Support & Resistance (excluding current candle)
+    df['recent_low'] = df['low'].shift(1).rolling(20).min()
+    df['recent_high'] = df['high'].shift(1).rolling(20).max()
+    
+    # Target definition for AI
     df['target'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
     return df
 
-# --- 3. ADAPTIVE AI MODEL WITH PENALTY FILTER ---
+# --- 3. WHALE-TRAP SCANNER ---
+def check_whale_sweep(df_clean):
+    latest = df_clean.iloc[-1]
+    atr = float(latest['atr'])
+    
+    # Bullish Liquidity Sweep (Whale Buy after hunting stop-losses below support)
+    if latest['low'] < latest['recent_low'] and latest['close'] > latest['recent_low']:
+        if latest['lower_wick_ratio'] >= 0.45 and latest['vol_surge'] >= 1.3:
+            sl = round(latest['low'] - (0.5 * atr), 1)
+            tp = round(latest['close'] + (2.5 * atr), 1)
+            return "BUY", 0.88, sl, tp, 4, "WHALE_BULLISH_SWEEP"
+
+    # Bearish Liquidity Sweep (Whale Sell after hunting stop-losses above resistance)
+    if latest['high'] > latest['recent_high'] and latest['close'] < latest['recent_high']:
+        if latest['upper_wick_ratio'] >= 0.45 and latest['vol_surge'] >= 1.3:
+            sl = round(latest['high'] + (0.5 * atr), 1)
+            tp = round(latest['close'] - (2.5 * atr), 1)
+            return "SELL", 0.88, sl, tp, 4, "WHALE_BEARISH_SWEEP"
+
+    return None
+
+# --- 4. ADAPTIVE AI PREDICTION ---
 def predict_signal(df):
     if df is None or len(df) < 60:
-        return "HOLD", 0.0, 0.0, 0.0, 2
+        return "HOLD", 0.0, 0.0, 0.0, 2, "INSUFFICIENT_DATA"
     
     df = add_indicators(df)
     df_clean = df.dropna()
     
-    features = ['return', 'ma7', 'ma25', 'volume', 'atr', 'rsi']
+    # Priority 1: Check Whale Liquidity Trap
+    whale_signal = check_whale_sweep(df_clean)
+    if whale_signal:
+        return whale_signal
+    
+    # Priority 2: Gradient Boosting Model with Sweep Features
+    features = ['return', 'ma7', 'ma25', 'volume', 'atr', 'rsi', 'lower_wick_ratio', 'upper_wick_ratio', 'vol_surge']
     X = df_clean[features][:-1]
     y = df_clean['target'][:-1]
     
-    # Gradient Boosting Classifier for adaptive learning
     model = GradientBoostingClassifier(n_estimators=120, learning_rate=0.08, max_depth=3, random_state=42)
     model.fit(X, y)
     
@@ -135,14 +171,12 @@ def predict_signal(df):
     probabilities = model.predict_proba(latest_features)[0]
     prob_down, prob_up = float(probabilities[0]), float(probabilities[1])
     
-    # Self-Learning Threshold Adjustment
     memory = load_memory()
     dynamic_threshold = CONFIDENCE_BASE_THRESHOLD + memory.get("loss_penalty", 0.0)
     
     current_atr = float(df_clean['atr'].iloc[-1])
     latest_close = float(df_clean['close'].iloc[-1])
     
-    # Dynamic Leverage & Decisions
     if prob_up >= dynamic_threshold:
         action = "BUY"
         conf = prob_up
@@ -150,9 +184,8 @@ def predict_signal(df):
         action = "SELL"
         conf = prob_down
     else:
-        return "HOLD", max(prob_up, prob_down), 0.0, 0.0, 2
+        return "HOLD", max(prob_up, prob_down), 0.0, 0.0, 2, "AI_WAIT_AND_SEE"
     
-    # Scale leverage based on AI confidence
     if conf >= 0.75:
         leverage = 5
     elif conf >= 0.65:
@@ -162,7 +195,6 @@ def predict_signal(df):
     else:
         leverage = 2
         
-    # Dynamic SL & Target based on ATR (1:2 Risk-Reward)
     sl_distance = current_atr * 1.5
     tp_distance = current_atr * 3.0
     
@@ -173,9 +205,9 @@ def predict_signal(df):
         stop_loss = round(latest_close + sl_distance, 1)
         take_profit = round(latest_close - tp_distance, 1)
         
-    return action, conf, stop_loss, take_profit, leverage
+    return action, conf, stop_loss, take_profit, leverage, "AI_TREND_FOLLOW"
 
-# --- 4. ORDER EXECUTION WITH BRACKET LIMITS ---
+# --- 5. ORDER EXECUTION ---
 def place_order_with_brackets(action, size, stop_loss, take_profit):
     try:
         path = "/v2/orders"
@@ -195,24 +227,26 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
-# --- 5. ENDPOINT TRIGGER ---
+# --- 6. ENDPOINT TRIGGER ---
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
-    print("\n================= [AI ADAPTIVE CYCLE START] =================")
+    print("\n================= [AI & WHALE TRACKER START] =================")
     df = fetch_market_data()
-    action, confidence, sl, tp, leverage = predict_signal(df)
+    action, confidence, sl, tp, leverage, strategy_tag = predict_signal(df)
     balance = get_available_balance()
     memory = load_memory()
     
-    print(f"[MARKET ANALYSIS] Signal: {action} | Confidence: {confidence*100:.2f}% | Dynamic Leverage: {leverage}x")
-    print(f"[RISK CONTROL] Dynamic SL: {sl} | Dynamic Target: {tp} | Loss Penalty: +{memory.get('loss_penalty', 0.0)*100:.2f}%")
+    print(f"[STRATEGY] Triggered: {strategy_tag} | Signal: {action}")
+    print(f"[CONFIDENCE] {confidence*100:.2f}% | Dynamic Leverage: {leverage}x")
+    print(f"[RISK CONTROL] SL: {sl} | Target: {tp} | Penalty: +{memory.get('loss_penalty', 0.0)*100:.2f}%")
     print(f"[WALLET] Live Balance: ${balance:.2f}")
     
     if action in ["BUY", "SELL"]:
         if balance <= 0:
-            print("[ABORT] ટ્રેડ કેન્સલ: વોલેટ બેલેન્સ $0 છે.")
+            print("[ABORT] Cancelled: Wallet Balance $0 che.")
             return jsonify({
                 "status": "FAILED_NO_BALANCE",
+                "strategy": strategy_tag,
                 "action": action,
                 "confidence": f"{confidence * 100:.2f}%",
                 "balance": f"${balance:.2f}"
@@ -227,6 +261,7 @@ def execute_trade():
         
         return jsonify({
             "status": "ORDER_PLACED",
+            "strategy": strategy_tag,
             "action": action,
             "confidence": f"{confidence * 100:.2f}%",
             "contracts": contracts,
@@ -238,6 +273,7 @@ def execute_trade():
         
     return jsonify({
         "status": "WAIT_AND_SEE",
+        "strategy": strategy_tag,
         "action": "HOLD",
         "confidence": f"{confidence * 100:.2f}%",
         "balance": f"${balance:.2f}"
@@ -245,4 +281,4 @@ def execute_trade():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-        
+    
