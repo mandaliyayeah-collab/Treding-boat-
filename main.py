@@ -32,7 +32,6 @@ PRODUCT_ID = 27
 MODEL_FILE = "ai_brain_model.pkl"
 MEMORY_FILE = "trade_memory.json"
 
-# DRY_RUN: true = ઓર્ડર મોકલ્યા વગર ટેસ્ટિંગ, false = લાઈવ ઓર્ડર
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 CONFIDENCE_BASE_THRESHOLD = 0.60
 MARGIN_ALLOCATION_PERCENT = 0.05
@@ -125,7 +124,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 # =========================================================
-# 3. WALLET BALANCE & MARKET DATA
+# 3. FIX: WALLET BALANCE & MARKET DATA (NO INSUFFICIENT DATA)
 # =========================================================
 def get_available_balance():
     try:
@@ -134,10 +133,14 @@ def get_available_balance():
         res = requests.get(BASE_URL + path, headers=headers, timeout=10)
         data = res.json()
         if not data.get("success"):
+            print(f"[BALANCE API ERROR] {data}")
             return 0.0
+            
         for item in data.get("result", []):
-            if item.get("asset_symbol") in ["USD", "USDT"]:
-                return float(item.get("available_balance", 0.0))
+            if item.get("asset_symbol") in ["USD", "USDT", "INR"]:
+                bal = float(item.get("available_balance", 0.0))
+                if bal > 0:
+                    return bal
         return 0.0
     except Exception as e:
         print(f"[BALANCE ERROR] {e}")
@@ -145,21 +148,21 @@ def get_available_balance():
 
 def fetch_market_data():
     try:
-        path = "/v2/chart/history"
-        end = int(time.time())
-        start = end - (15 * 60 * 300)
-        params = {"symbol": SYMBOL, "resolution": "15", "start": start, "end": end}
-        res = requests.get(BASE_URL + path, params=params, timeout=10)
+        path = f"/v2/chart/history?symbol={SYMBOL}&resolution=15"
+        res = requests.get(BASE_URL + path, timeout=10)
         data = res.json()
-        if not data.get("success"):
-            return None
+        
         candles = data.get("result", [])
         if not candles:
+            print("[MARKET ERROR] કેન્ડલ્સ મળી નથી.")
             return None
+            
         df = pd.DataFrame(candles)
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.dropna().reset_index(drop=True)
+            
+        df = df.dropna().reset_index(drop=True)
+        return df
     except Exception as e:
         print(f"[MARKET ERROR] {e}")
         return None
@@ -171,14 +174,18 @@ def fetch_order_book_metrics():
         data = res.json()
         if not data.get("success"):
             return 0.0, 0.0, 0.0
+            
         book = data.get("result", {})
         bids = book.get("buy", [])
         asks = book.get("sell", [])
+        
         if not bids or not asks:
             return 0.0, 0.0, 0.0
+            
         top_bids = sum(float(x.get("size", 0)) for x in bids[:10])
         top_asks = sum(float(x.get("size", 0)) for x in asks[:10])
-        obi = (top_bids - top_asks) / (top_bids + top_asks + 1e-9)
+        total = top_bids + top_asks + 1e-9
+        obi = (top_bids - top_asks) / total
         return obi, top_bids, top_asks
     except Exception as e:
         print(f"[ORDER BOOK ERROR] {e}")
@@ -237,14 +244,12 @@ def check_institutional_sweep(df):
     obi_ratio, _, _ = fetch_order_book_metrics()
     tick_size = get_product_specs()["tick_size"]
 
-    # Bullish Trap
     if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
         if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
             sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
             tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
             return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
 
-    # Bearish Trap
     if latest["high"] > latest["recent_high"] and latest["close"] < latest["recent_high"]:
         if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
             sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
@@ -271,12 +276,12 @@ def build_ai_pipeline():
 def train_and_save_ai_brain():
     print(f"\n[{datetime.now()}] [AI] Auto Re-training શરૂ થઈ રહ્યું છે...")
     df = fetch_market_data()
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 60:
         return None
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 80:
+    if len(df_clean) < 40:
         return None
 
     X = df_clean[FEATURES][:-1]
@@ -315,12 +320,12 @@ def calculate_contracts(balance, leverage, entry_price):
 # 8. PREDICTION ENGINE
 # =========================================================
 def predict_signal(df):
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 40:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 50:
+    if len(df_clean) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
     # Priority 1: Institutional Sweep
@@ -408,7 +413,7 @@ def execute_trade():
     df = fetch_market_data()
     action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
     balance = get_available_balance()
-    latest_close = float(df["close"].iloc[-1]) if df is not None else 0.0
+    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
 
     if action in ["BUY", "SELL"]:
         contracts = calculate_contracts(balance, leverage, latest_close)
@@ -442,7 +447,6 @@ def execute_trade():
         "balance": f"${balance:.2f}"
     }), 200
 
-
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
 scheduler.start()
@@ -451,4 +455,4 @@ if __name__ == "__main__":
     if not os.path.exists(MODEL_FILE):
         train_and_save_ai_brain()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
+            
