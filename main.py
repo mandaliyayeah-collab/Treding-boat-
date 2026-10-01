@@ -579,4 +579,44 @@ def execute_trade():
 
         order_res = place_order_with_brackets(action, contracts, sl, tp)
 
-        memory = l
+                memory = load_memory()
+        memory["open_position"] = {
+            "side": action,
+            "entry": latest_close,
+            "sl": sl,
+            "tp": tp
+        }
+        save_memory(memory)
+
+        return jsonify({
+            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
+            "action": action,
+            "confidence": f"{conf*100:.2f}%",
+            "contracts": contracts,
+            "leverage": f"{leverage}x",
+            "entry": latest_close,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "funding_rate": f"{funding*100:.4f}%",
+            "strategy": strategy_tag,
+            "delta_response": order_res
+        }), 200
+
+    return jsonify({
+        "status": "WAIT_AND_SEE",
+        "action": "HOLD",
+        "confidence": f"{conf*100:.2f}%",
+        "funding_rate": f"{funding*100:.4f}%",
+        "strategy": strategy_tag,
+        "balance": f"₹{balance:.2f}"
+    }), 200
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
+scheduler.start()
+
+if __name__ == "__main__":
+    if not os.path.exists(MODEL_FILE):
+        train_and_save_ai_brain()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    
