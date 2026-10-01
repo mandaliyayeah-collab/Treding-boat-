@@ -22,7 +22,7 @@ app = Flask(__name__)
 # =========================================================
 # CONFIGURATION
 # =========================================================
-BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.delta.exchange")
+BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.india.delta.exchange")
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 
@@ -32,7 +32,7 @@ PRODUCT_ID = 27
 MODEL_FILE = "ai_brain_model.pkl"
 MEMORY_FILE = "trade_memory.json"
 
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 CONFIDENCE_BASE_THRESHOLD = 0.60
 MARGIN_ALLOCATION_PERCENT = 0.05
 MAX_LEVERAGE = 5
@@ -97,26 +97,24 @@ def save_memory(data):
 # =========================================================
 # 2. PRODUCT SPECS & TICK ROUNDING
 # =========================================================
-def get_product():
-    try:
-        path = f"/v2/products/{SYMBOL}"
-        res = requests.get(BASE_URL + path, timeout=10, headers={"Accept": "application/json"})
-        data = res.json()
-        if data.get("success"):
-            return data.get("result")
-        return None
-    except Exception as e:
-        print(f"[PRODUCT ERROR] {e}")
-        return None
-
 def get_product_specs():
-    product = get_product()
-    if not product:
-        return {"contract_value": 0.001, "tick_size": 0.5}
-    return {
-        "contract_value": float(product.get("contract_value", 0.001)),
-        "tick_size": float(product.get("tick_size", 0.5))
-    }
+    endpoints = [
+        f"{BASE_URL}/v2/products/{SYMBOL}",
+        f"https://api.delta.exchange/v2/products/{SYMBOL}"
+    ]
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5, headers={"Accept": "application/json"})
+            data = res.json()
+            if data.get("success") and data.get("result"):
+                product = data.get("result")
+                return {
+                    "contract_value": float(product.get("contract_value", 0.001)),
+                    "tick_size": float(product.get("tick_size", 0.5))
+                }
+        except Exception:
+            continue
+    return {"contract_value": 0.001, "tick_size": 0.5}
 
 def round_to_tick(price, tick_size):
     if tick_size <= 0:
@@ -124,7 +122,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 # =========================================================
-# 3. FIX: WALLET BALANCE & MARKET DATA (NO INSUFFICIENT DATA)
+# 3. WALLET BALANCE & MARKET DATA (MULTI-ENDPOINT FIX)
 # =========================================================
 def get_available_balance():
     try:
@@ -133,7 +131,6 @@ def get_available_balance():
         res = requests.get(BASE_URL + path, headers=headers, timeout=10)
         data = res.json()
         if not data.get("success"):
-            print(f"[BALANCE API ERROR] {data}")
             return 0.0
             
         for item in data.get("result", []):
@@ -147,52 +144,61 @@ def get_available_balance():
         return 0.0
 
 def fetch_market_data():
-    try:
-        path = f"/v2/chart/history?symbol={SYMBOL}&resolution=15"
-        res = requests.get(BASE_URL + path, timeout=10)
-        data = res.json()
-        
-        candles = data.get("result", [])
-        if not candles:
-            print("[MARKET ERROR] કેન્ડલ્સ મળી નથી.")
-            return None
-            
-        df = pd.DataFrame(candles)
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            
-        df = df.dropna().reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f"[MARKET ERROR] {e}")
+    endpoints = [
+        f"{BASE_URL}/v2/chart/history?symbol={SYMBOL}&resolution=15",
+        f"https://api.india.delta.exchange/v2/chart/history?symbol={SYMBOL}&resolution=15",
+        f"https://api.delta.exchange/v2/chart/history?symbol={SYMBOL}&resolution=15"
+    ]
+    
+    candles = None
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=7)
+            res_json = res.json()
+            if res_json.get("result") and len(res_json.get("result")) > 0:
+                candles = res_json.get("result")
+                break
+        except Exception:
+            continue
+
+    if not candles:
+        print("[MARKET ERROR] Candles data empty aavyo.")
         return None
 
+    df = pd.DataFrame(candles)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna().reset_index(drop=True)
+    return df
+
 def fetch_order_book_metrics():
-    try:
-        path = f"/v2/l2orderbook/{SYMBOL}"
-        res = requests.get(BASE_URL + path, timeout=5)
-        data = res.json()
-        if not data.get("success"):
-            return 0.0, 0.0, 0.0
-            
-        book = data.get("result", {})
-        bids = book.get("buy", [])
-        asks = book.get("sell", [])
-        
-        if not bids or not asks:
-            return 0.0, 0.0, 0.0
-            
-        top_bids = sum(float(x.get("size", 0)) for x in bids[:10])
-        top_asks = sum(float(x.get("size", 0)) for x in asks[:10])
-        total = top_bids + top_asks + 1e-9
-        obi = (top_bids - top_asks) / total
-        return obi, top_bids, top_asks
-    except Exception as e:
-        print(f"[ORDER BOOK ERROR] {e}")
-        return 0.0, 0.0, 0.0
+    endpoints = [
+        f"{BASE_URL}/v2/l2orderbook/{SYMBOL}",
+        f"https://api.india.delta.exchange/v2/l2orderbook/{SYMBOL}",
+        f"https://api.delta.exchange/v2/l2orderbook/{SYMBOL}"
+    ]
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if data.get("success"):
+                book = data.get("result", {})
+                bids = book.get("buy", [])
+                asks = book.get("sell", [])
+                if bids and asks:
+                    top_bids = sum(float(x.get("size", 0)) for x in bids[:10])
+                    top_asks = sum(float(x.get("size", 0)) for x in asks[:10])
+                    total = top_bids + top_asks + 1e-9
+                    obi = (top_bids - top_asks) / total
+                    return obi, top_bids, top_asks
+        except Exception:
+            continue
+    return 0.0, 0.0, 0.0
 
 # =========================================================
-# 4. QUANT INDICATORS & FEATURE ENGINEERING
+# 4. QUANT INDICATORS
 # =========================================================
 def add_indicators(df):
     df = df.copy()
@@ -259,7 +265,7 @@ def check_institutional_sweep(df):
     return None
 
 # =========================================================
-# 6. PROFESSIONAL AI BRAIN PIPELINE & AUTO RE-TRAINING
+# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING
 # =========================================================
 def build_ai_pipeline():
     return Pipeline([
@@ -274,14 +280,14 @@ def build_ai_pipeline():
     ])
 
 def train_and_save_ai_brain():
-    print(f"\n[{datetime.now()}] [AI] Auto Re-training શરૂ થઈ રહ્યું છે...")
+    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che...")
     df = fetch_market_data()
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 30:
         return None
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 40:
+    if len(df_clean) < 25:
         return None
 
     X = df_clean[FEATURES][:-1]
@@ -290,7 +296,7 @@ def train_and_save_ai_brain():
     pipeline = build_ai_pipeline()
     pipeline.fit(X, y)
     joblib.dump(pipeline, MODEL_FILE)
-    print(f"[{datetime.now()}] [AI] મોડેલ સફળતાપૂર્વક અપડેટ થયું: {MODEL_FILE}")
+    print(f"[{datetime.now()}] [AI] Model save thai gayu: {MODEL_FILE}")
     return pipeline
 
 def get_or_load_ai_brain():
@@ -320,12 +326,12 @@ def calculate_contracts(balance, leverage, entry_price):
 # 8. PREDICTION ENGINE
 # =========================================================
 def predict_signal(df):
-    if df is None or len(df) < 40:
+    if df is None or len(df) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 30:
+    if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
     # Priority 1: Institutional Sweep
@@ -334,7 +340,7 @@ def predict_signal(df):
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
 
-    # Priority 2: Pre-trained Persistent AI Brain
+    # Priority 2: Persistent AI Brain
     pipeline = get_or_load_ai_brain()
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
@@ -385,7 +391,7 @@ def predict_signal(df):
 # =========================================================
 def place_order_with_brackets(action, size, stop_loss, take_profit):
     if DRY_RUN:
-        return {"status": "DRY_RUN_SUCCESS", "message": "Dry run active. No real order sent."}
+        return {"status": "DRY_RUN_SUCCESS", "message": "Dry run active. No real order placed."}
     try:
         path = "/v2/orders"
         payload = {
@@ -405,7 +411,7 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         return {"error": str(e)}
 
 # =========================================================
-# 10. FLASK ENDPOINTS & BACKGROUND SCHEDULER
+# 10. FLASK ROUTES & SCHEDULER
 # =========================================================
 @app.route("/", methods=["GET"])
 @app.route("/execute-trade", methods=["GET"])
@@ -423,7 +429,7 @@ def execute_trade():
                 "strategy": strategy_tag,
                 "action": action,
                 "confidence": f"{conf*100:.2f}%",
-                "balance": f"${balance:.2f}"
+                "balance": f"₹{balance:.2f}"
             }), 200
 
         order_res = place_order_with_brackets(action, contracts, sl, tp)
@@ -444,9 +450,10 @@ def execute_trade():
         "action": "HOLD",
         "confidence": f"{conf*100:.2f}%",
         "strategy": strategy_tag,
-        "balance": f"${balance:.2f}"
+        "balance": f"₹{balance:.2f}"
     }), 200
 
+# Dar Ravivare ratre 12:00 vage auto-retrain thase
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
 scheduler.start()
@@ -455,4 +462,4 @@ if __name__ == "__main__":
     if not os.path.exists(MODEL_FILE):
         train_and_save_ai_brain()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-            
+    
