@@ -519,18 +519,13 @@ def execute_trade():
     balance = get_available_balance()
     funding = fetch_funding_rate()
 
-    # =====================================================
-    # BUY / SELL
-    # =====================================================
     if action in ["BUY", "SELL"]:
-
         contracts = calculate_contracts(
             balance,
             leverage,
             latest_close
         )
 
-        # No balance protection
         if balance <= 0 and not DRY_RUN:
             return jsonify({
                 "status": "FAILED_NO_BALANCE",
@@ -540,7 +535,6 @@ def execute_trade():
                 "balance": f"₹{balance:.2f}"
             }), 200
 
-        # Place order
         order_res = place_order_with_brackets(
             action,
             contracts,
@@ -548,9 +542,7 @@ def execute_trade():
             tp
         )
 
-        # Save position memory
         memory = load_memory()
-
         memory["open_position"] = {
             "side": action,
             "entry": latest_close,
@@ -559,14 +551,19 @@ def execute_trade():
             "max_price": latest_close,
             "min_price": latest_close
         }
-
         save_memory(memory)
 
-        # Response
         return jsonify({
             "status": (
                 "ORDER_PLACED"
                 if not DRY_RUN
                 else "SIMULATED_ORDER"
             ),
-            "a
+            "action": action,
+            "confidence": f"{conf * 100:.2f}%",
+            "contracts": contracts,
+            "leverage": f"{leverage}x",
+            "entry": latest_close,
+            "stop_loss": sl,
+            "take_profit": tp,
+         
