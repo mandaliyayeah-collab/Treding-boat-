@@ -37,7 +37,7 @@ CONFIDENCE_BASE_THRESHOLD = 0.60
 MARGIN_ALLOCATION_PERCENT = 0.05
 MAX_LEVERAGE = 5
 
-FEATURES = FEATURES = [
+FEATURES = [
     "return",
     "ma7",
     "ma25",
@@ -53,10 +53,6 @@ FEATURES = FEATURES = [
     "adx",
     "chop_index"
 ]
-
-
-
-
 
 # =========================================================
 # AUTHENTICATION
@@ -179,7 +175,6 @@ def fetch_market_data():
         base_urls = list(dict.fromkeys(base_urls))
 
         candles = None
-        successful_url = None
 
         for base in base_urls:
             url = f"{base}/v2/history/candles"
@@ -210,7 +205,6 @@ def fetch_market_data():
 
                 candles = data.get("result")
                 if candles and isinstance(candles, list) and len(candles) > 0:
-                    successful_url = url
                     break
             except Exception as e:
                 print(f"[API ATTEMPT ERROR] {e}")
@@ -304,6 +298,23 @@ def add_indicators(df):
     df["norm_atr"] = df["atr"] / (df["close"] + 1e-9)
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
+
+    # --- ADX ---
+    up = df["high"] - df["high"].shift(1)
+    down = df["low"].shift(1) - df["low"]
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    tr_smooth = tr.rolling(14).sum()
+    plus_di = 100 * (plus_dm.rolling(14).sum() / (tr_smooth + 1e-9))
+    minus_di = 100 * (minus_dm.rolling(14).sum() / (tr_smooth + 1e-9))
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
+    df["adx"] = dx.rolling(14).mean()
+
+    # --- Choppiness Index ---
+    sum_tr = tr.rolling(14).sum()
+    max_h = df["high"].rolling(14).max()
+    min_l = df["low"].rolling(14).min()
+    df["chop_index"] = 100 * (np.log10(sum_tr / (max_h - min_l + 1e-9)) / np.log10(14))
 
     df["recent_low"] = df["low"].shift(1).rolling(20).min()
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
@@ -533,4 +544,4 @@ if __name__ == "__main__":
     if not os.path.exists(MODEL_FILE):
         train_and_save_ai_brain()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
+            
