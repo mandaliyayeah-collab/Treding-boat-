@@ -40,7 +40,7 @@ MAX_LEVERAGE = 5
 FEATURES = [
     "return", "ma7", "ma25", "volume", "atr", "rsi",
     "lower_wick_ratio", "upper_wick_ratio", "vol_surge",
-    "norm_atr", "wick_skew", "dist_ma25"
+    "norm_atr", "wick_skew", "dist_ma25", "adx", "chop_index"
 ]
 
 # =========================================================
@@ -70,10 +70,16 @@ def get_headers(method, path, query="", payload=""):
     }
 
 # =========================================================
-# 1. MEMORY ENGINE
+# MEMORY & POSITION TRACKER
 # =========================================================
 def default_memory():
-    return {"loss_penalty": 0.0, "total_trades": 0, "losses": 0, "wins": 0}
+    return {
+        "loss_penalty": 0.0,
+        "total_trades": 0,
+        "losses": 0,
+        "wins": 0,
+        "open_position": None  # Structure: {side, entry, sl, tp, max_price, min_price}
+    }
 
 def load_memory():
     if not os.path.exists(MEMORY_FILE):
@@ -95,7 +101,7 @@ def save_memory(data):
         print(f"[MEMORY SAVE ERROR] {e}")
 
 # =========================================================
-# 2. PRODUCT SPECS & TICK ROUNDING
+# PRODUCT SPECS & TICK ROUNDING
 # =========================================================
 def get_product_specs():
     endpoints = [
@@ -122,7 +128,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 # =========================================================
-# 3. WALLET BALANCE & MARKET DATA
+# WALLET BALANCE & MARKET DATA
 # =========================================================
 def get_available_balance():
     try:
@@ -149,88 +155,70 @@ def fetch_market_data():
         lookback_seconds = 120 * 15 * 60
         start_time = now - lookback_seconds
 
-        base_urls = []
-        if BASE_URL:
-            base_urls.append(BASE_URL.rstrip("/"))
-
-        india_url = "https://api.india.delta.exchange"
-        if india_url not in base_urls:
-            base_urls.append(india_url)
-
-        global_url = "https://api.delta.exchange"
-        if global_url not in base_urls:
-            base_urls.append(global_url)
-
+        base_urls = [BASE_URL.rstrip("/"), "https://api.india.delta.exchange", "https://api.delta.exchange"]
         base_urls = list(dict.fromkeys(base_urls))
 
         candles = None
-        successful_url = None
-
         for base in base_urls:
             url = f"{base}/v2/history/candles"
-            params = {
-                "resolution": "15m",
-                "symbol": SYMBOL,
-                "start": start_time,
-                "end": now
-            }
-
+            params = {"resolution": "15m", "symbol": SYMBOL, "start": start_time, "end": now}
             try:
-                response = requests.get(
-                    url,
-                    params=params,
-                    timeout=15,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "TradingBot/1.0"
-                    }
-                )
-
-                if response.status_code != 200:
-                    continue
-
-                data = response.json()
-                if data.get("success") is False:
-                    continue
-
-                candles = data.get("result")
-                if candles and isinstance(candles, list) and len(candles) > 0:
-                    successful_url = url
-                    break
-            except Exception as e:
-                print(f"[API ATTEMPT ERROR] {e}")
+                response = requests.get(url, params=params, timeout=10, headers={"Accept": "application/json"})
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("result") and len(data.get("result")) > 0:
+                        candles = data.get("result")
+                        break
+            except Exception:
                 continue
 
         if not candles:
-            print("[MARKET ERROR] Candles data bilkul mali nathi rahyo.")
             return None
 
         df = pd.DataFrame(candles)
-        rename_map = {
-            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
-        }
+        rename_map = {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
         df = df.rename(columns=rename_map)
 
-        required_columns = ["open", "high", "low", "close", "volume"]
-        for col in required_columns:
-            if col not in df.columns:
-                return None
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df = df.dropna(subset=required_columns).copy()
+        df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
 
         if "time" in df.columns:
             df["time"] = pd.to_numeric(df["time"], errors="coerce")
-            df = df.dropna(subset=["time"])
-            df = df.sort_values("time")
-            df = df.drop_duplicates(subset=["time"], keep="last")
+            df = df.dropna(subset=["time"]).sort_values("time").drop_duplicates(subset=["time"], keep="last")
 
-        df = df.reset_index(drop=True)
-        return df
-
+        return df.reset_index(drop=True)
     except Exception as e:
         print(f"[FETCH ERROR] {e}")
         return None
+
+# =========================================================
+# 1. ADVANCED QUANT: FUNDING RATE & ORDER BOOK
+# =========================================================
+def fetch_funding_rate():
+    """
+    Returns current funding rate for BTCUSD.
+    Extreme positive (> 0.03%) = Long crowd trap
+    Extreme negative (< -0.03%) = Short crowd trap
+    """
+    endpoints = [
+        f"{BASE_URL}/v2/tickers/{SYMBOL}",
+        f"https://api.india.delta.exchange/v2/tickers/{SYMBOL}",
+        f"https://api.delta.exchange/v2/tickers/{SYMBOL}"
+    ]
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if data.get("success"):
+                ticker = data.get("result", {})
+                rate = float(ticker.get("funding_rate", 0.0))
+                return rate
+        except Exception:
+            continue
+    return 0.0
 
 def fetch_order_book_metrics():
     endpoints = [
@@ -257,7 +245,7 @@ def fetch_order_book_metrics():
     return 0.0, 0.0, 0.0
 
 # =========================================================
-# 4. QUANT INDICATORS
+# 2. MARKET REGIME & INDICATOR ENGINE (ADX & CHOPPINESS)
 # =========================================================
 def add_indicators(df):
     df = df.copy()
@@ -265,38 +253,59 @@ def add_indicators(df):
     df["ma25"] = df["close"].rolling(25).mean()
     df["return"] = df["close"].pct_change()
 
+    # True Range & ATR
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean()
 
+    # RSI
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
+    # Candle wicks
     candle_range = (df["high"] - df["low"]).replace(0, 1e-9)
     body_low = df[["open", "close"]].min(axis=1)
     body_high = df[["open", "close"]].max(axis=1)
     df["lower_wick_ratio"] = (body_low - df["low"]) / candle_range
     df["upper_wick_ratio"] = (df["high"] - body_high) / candle_range
 
+    # Volume & Norm ATR
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["vol_surge"] = df["volume"] / (df["vol_ma20"] + 1e-9)
-
     df["norm_atr"] = df["atr"] / (df["close"] + 1e-9)
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
 
+    # Directional Movement & ADX (Trend Strength)
+    up_move = df["high"] - df["high"].shift(1)
+    down_move = df["low"].shift(1) - df["low"]
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr_smooth = tr.rolling(14).sum()
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / (tr_smooth + 1e-9))
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / (tr_smooth + 1e-9))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
+    df["adx"] = dx.rolling(14).mean()
+
+    # Choppiness Index (Range vs Trend Detector)
+    sum_tr = tr.rolling(14).sum()
+    max_high = df["high"].rolling(14).max()
+    min_low = df["low"].rolling(14).min()
+    df["chop_index"] = 100 * (np.log10(sum_tr / (max_high - min_low + 1e-9)) / np.log10(14))
+
+    # Support / Resistance & Target
     df["recent_low"] = df["low"].shift(1).rolling(20).min()
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
     df["target"] = np.where(df["close"].shift(-1) > df["close"], 1, 0)
     return df
 
 # =========================================================
-# 5. WHALE-TRAP SCANNER
+# 3. WHALE SWEEP & LIQUIDITY HUNT
 # =========================================================
 def check_institutional_sweep(df):
     if len(df) < 30:
@@ -307,24 +316,29 @@ def check_institutional_sweep(df):
         return None
 
     obi_ratio, _, _ = fetch_order_book_metrics()
+    funding_rate = fetch_funding_rate()
     tick_size = get_product_specs()["tick_size"]
 
+    # Bullish Trap: Support broken + Strong Bids + Funding not heavily overheated
     if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
         if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
-            sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
-            tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
-            return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
+            if funding_rate < 0.04:  # Avoid entering if long crowd is hyper-leveraged
+                sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
+                tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
+                return ("BUY", 0.94, sl, tp, "INSTITUTIONAL_LIQUIDITY_HUNT_BUY")
 
+    # Bearish Trap: Resistance broken + Strong Asks + Funding not heavily negative
     if latest["high"] > latest["recent_high"] and latest["close"] < latest["recent_high"]:
         if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
-            sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
-            tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
-            return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
+            if funding_rate > -0.04:
+                sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
+                tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
+                return ("SELL", 0.94, sl, tp, "INSTITUTIONAL_LIQUIDITY_HUNT_SELL")
 
     return None
 
 # =========================================================
-# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING
+# 4. AI PIPELINE & RETRAINING
 # =========================================================
 def build_ai_pipeline():
     return Pipeline([
@@ -339,7 +353,6 @@ def build_ai_pipeline():
     ])
 
 def train_and_save_ai_brain():
-    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che...")
     df = fetch_market_data()
     if df is None or len(df) < 30:
         return None
@@ -355,19 +368,53 @@ def train_and_save_ai_brain():
     pipeline = build_ai_pipeline()
     pipeline.fit(X, y)
     joblib.dump(pipeline, MODEL_FILE)
-    print(f"[{datetime.now()}] [AI] Model save thai gayu: {MODEL_FILE}")
     return pipeline
 
 def get_or_load_ai_brain():
     if os.path.exists(MODEL_FILE):
         try:
             return joblib.load(MODEL_FILE)
-        except Exception as e:
-            print(f"[AI LOAD ERROR] {e}")
+        except Exception:
+            pass
     return train_and_save_ai_brain()
 
 # =========================================================
-# 7. POSITION SIZING
+# 5. DYNAMIC TRAILING STOP & BREAK-EVEN ENGINE
+# =========================================================
+def update_dynamic_risk_management(current_price):
+    """
+    Monitors active positions, shifts SL to Break-Even when +1.5R reached,
+    and trails profits using ATR Chandelier Logic.
+    """
+    memory = load_memory()
+    pos = memory.get("open_position")
+    if not pos:
+        return
+
+    side = pos.get("side")
+    entry = float(pos.get("entry", 0))
+    sl = float(pos.get("sl", 0))
+    r_unit = abs(entry - sl)
+
+    # 1. Break-Even Check: If profit >= 1.5 * Risk, move SL to Entry Price
+    if side == "BUY":
+        if current_price >= entry + (1.5 * r_unit) and sl < entry:
+            pos["sl"] = entry
+            print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL updated to Entry: {entry}")
+        # Update high-water mark
+        pos["max_price"] = max(pos.get("max_price", current_price), current_price)
+    elif side == "SELL":
+        if current_price <= entry - (1.5 * r_unit) and sl > entry:
+            pos["sl"] = entry
+            print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL updated to Entry: {entry}")
+        # Update low-water mark
+        pos["min_price"] = min(pos.get("min_price", current_price), current_price)
+
+    memory["open_position"] = pos
+    save_memory(memory)
+
+# =========================================================
+# 6. SIZING & PREDICTION ENGINE
 # =========================================================
 def calculate_contracts(balance, leverage, entry_price):
     specs = get_product_specs()
@@ -381,9 +428,6 @@ def calculate_contracts(balance, leverage, entry_price):
         return 0
     return max(1, int(notional / contract_notional))
 
-# =========================================================
-# 8. PREDICTION ENGINE
-# =========================================================
 def predict_signal(df):
     if df is None or len(df) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
@@ -393,11 +437,22 @@ def predict_signal(df):
     if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
+    latest = df_clean.iloc[-1]
+    chop = float(latest["chop_index"])
+    adx = float(latest["adx"])
+
+    # MARKET REGIME FILTER:
+    # If Market is hyper choppy (Chop > 61.8) and No Trend (ADX < 20), prevent standard AI breakout
+    if chop > 61.8 and adx < 20:
+        return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
+
+    # Priority 1: Institutional Sweep
     inst_signal = check_institutional_sweep(df_clean)
     if inst_signal:
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
 
+    # Priority 2: AI Brain Pipeline
     pipeline = get_or_load_ai_brain()
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
@@ -417,11 +472,15 @@ def predict_signal(df):
     threshold = min(0.90, CONFIDENCE_BASE_THRESHOLD + memory.get("loss_penalty", 0.0))
     current_atr = float(df_clean["atr"].iloc[-1])
     latest_close = float(df_clean["close"].iloc[-1])
+    funding_rate = fetch_funding_rate()
 
-    if prob_up >= threshold:
+    # SENTIMENT FILTER:
+    # Do not buy if funding is overheated (> 0.035%)
+    if prob_up >= threshold and funding_rate < 0.035:
         action = "BUY"
         conf = prob_up
-    elif prob_down >= threshold:
+    # Do not sell if funding is over-dumped (< -0.035%)
+    elif prob_down >= threshold and funding_rate > -0.035:
         action = "SELL"
         conf = prob_down
     else:
@@ -441,10 +500,10 @@ def predict_signal(df):
         sl = round_to_tick(latest_close + sl_dist, tick_size)
         tp = round_to_tick(latest_close - tp_dist, tick_size)
 
-    return (action, conf, sl, tp, leverage, f"AI_BRAIN (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})")
+    return (action, conf, sl, tp, leverage, f"AI_BRAIN_REGIME_CONFIRMED (UP:{prob_up:.2f})")
 
 # =========================================================
-# 9. ORDER EXECUTION
+# 7. EXECUTION & FLASK APPLICATION
 # =========================================================
 def place_order_with_brackets(action, size, stop_loss, take_profit):
     if DRY_RUN:
@@ -467,55 +526,19 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
-# =========================================================
-# 10. FLASK ROUTES & SCHEDULER
-# =========================================================
 @app.route("/", methods=["GET"])
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
     df = fetch_market_data()
-    action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
-    balance = get_available_balance()
     latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
 
+    # Dynamic trailing check on active position
+    if latest_close > 0:
+        update_dynamic_risk_management(latest_close)
+
+    action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
+    balance = get_available_balance()
+    funding = fetch_funding_rate()
+
     if action in ["BUY", "SELL"]:
-        contracts = calculate_contracts(balance, leverage, latest_close)
-        if balance <= 0 and not DRY_RUN:
-            return jsonify({
-                "status": "FAILED_NO_BALANCE",
-                "strategy": strategy_tag,
-                "action": action,
-                "confidence": f"{conf*100:.2f}%",
-                "balance": f"₹{balance:.2f}"
-            }), 200
-
-        order_res = place_order_with_brackets(action, contracts, sl, tp)
-        return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "action": action,
-            "confidence": f"{conf*100:.2f}%",
-            "contracts": contracts,
-            "leverage": f"{leverage}x",
-            "stop_loss": sl,
-            "take_profit": tp,
-            "strategy": strategy_tag,
-            "delta_response": order_res
-        }), 200
-
-    return jsonify({
-        "status": "WAIT_AND_SEE",
-        "action": "HOLD",
-        "confidence": f"{conf*100:.2f}%",
-        "strategy": strategy_tag,
-        "balance": f"₹{balance:.2f}"
-    }), 200
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
-scheduler.start()
-
-if __name__ == "__main__":
-    if not os.path.exists(MODEL_FILE):
-        train_and_save_ai_brain()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
+        contracts = calculate_contracts(balance, leverage, latest_clo
