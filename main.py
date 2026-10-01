@@ -195,7 +195,7 @@ def fetch_market_data():
         return None
 
 # =========================================================
-# 1. ADVANCED QUANT: FUNDING RATE & ORDER BOOK
+# 1. QUANT: FUNDING RATE & ORDER BOOK
 # =========================================================
 def fetch_funding_rate():
     endpoints = [
@@ -239,7 +239,7 @@ def fetch_order_book_metrics():
     return 0.0, 0.0, 0.0
 
 # =========================================================
-# 2. MARKET REGIME & INDICATOR ENGINE (ADX & CHOPPINESS)
+# 2. MARKET REGIME & INDICATOR ENGINE
 # =========================================================
 def add_indicators(df):
     df = df.copy()
@@ -292,7 +292,7 @@ def add_indicators(df):
     return df
 
 # =========================================================
-# 3. WHALE SWEEP & LIQUIDITY HUNT
+# 3. WHALE SWEEP DETECTION
 # =========================================================
 def check_institutional_sweep(df):
     if len(df) < 30:
@@ -364,7 +364,7 @@ def get_or_load_ai_brain():
     return train_and_save_ai_brain()
 
 # =========================================================
-# 5. DYNAMIC TRAILING STOP & BREAK-EVEN ENGINE
+# 5. DYNAMIC RISK MANAGEMENT (BREAK-EVEN)
 # =========================================================
 def update_dynamic_risk_management(current_price):
     memory = load_memory()
@@ -474,7 +474,7 @@ def predict_signal(df):
     return (action, conf, sl, tp, leverage, f"AI_BRAIN_REGIME_CONFIRMED (UP:{prob_up:.2f})")
 
 # =========================================================
-# 7. EXECUTION & FLASK APPLICATION
+# 7. ORDER EXECUTION
 # =========================================================
 def place_order_with_brackets(action, size, stop_loss, take_profit):
     if DRY_RUN:
@@ -497,6 +497,9 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
+# =========================================================
+# 8. FLASK APPLICATION & ROUTES
+# =========================================================
 @app.route("/", methods=["GET"])
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
@@ -550,6 +553,4 @@ def execute_trade():
 
     return jsonify({
         "status": "WAIT_AND_SEE",
-        "action": "HOLD",
-        "confidence": f"{conf*100:.2f}%",
-        "funding_rate": f"{funding*100:.4f}%"
+        "action
