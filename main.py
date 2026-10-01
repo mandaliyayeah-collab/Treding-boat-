@@ -40,7 +40,9 @@ MAX_LEVERAGE = 5
 FEATURES = [
     "return", "ma7", "ma25", "volume", "atr", "rsi",
     "lower_wick_ratio", "upper_wick_ratio", "vol_surge",
-    "norm_atr", "wick_skew", "dist_ma25"
+    "norm_atr", "wick_skew", "dist_ma25", "adx", "chop_index"
+]
+
 ]
 
 # =========================================================
