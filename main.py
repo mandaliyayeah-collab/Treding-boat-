@@ -144,11 +144,6 @@ def get_available_balance():
         return 0.0
 
 def fetch_market_data():
-    """
-    Fetch 15-minute candle data from Delta Exchange.
-    No silent failures:
-    Every important error is printed with exact reason.
-    """
     try:
         now = int(time.time())
         lookback_seconds = 120 * 15 * 60
@@ -180,14 +175,6 @@ def fetch_market_data():
                 "end": now
             }
 
-            print("\n" + "=" * 60)
-            print("[CANDLE REQUEST]")
-            print("URL      :", url)
-            print("SYMBOL   :", SYMBOL)
-            print("START    :", start_time)
-            print("END      :", now)
-            print("RESOLUTION: 15m")
-
             try:
                 response = requests.get(
                     url,
@@ -199,105 +186,38 @@ def fetch_market_data():
                     }
                 )
 
-                print("[HTTP STATUS]", response.status_code)
-
                 if response.status_code != 200:
-                    print("[HTTP ERROR]")
-                    print(response.text[:1000])
                     continue
 
-                try:
-                    data = response.json()
-                except ValueError as json_error:
-                    print("[JSON ERROR]", json_error)
-                    print("[RAW RESPONSE]")
-                    print(response.text[:1000])
-                    continue
-
-                print("[API SUCCESS FIELD]", data.get("success"))
-
+                data = response.json()
                 if data.get("success") is False:
-                    print("[DELTA API ERROR]")
-                    print(data)
                     continue
 
                 candles = data.get("result")
-
-                if candles is None:
-                    print("[DATA ERROR] 'result' field missing.")
-                    print("[FULL RESPONSE]")
-                    print(data)
-                    continue
-
-                if not isinstance(candles, list):
-                    print("[DATA ERROR] result is not a list.")
-                    print("[RESULT TYPE]", type(candles))
-                    print("[RESULT]", candles)
-                    continue
-
-                if len(candles) == 0:
-                    print("[DATA ERROR] API returned ZERO candles.")
-                    continue
-
-                print("[RAW CANDLES RECEIVED]", len(candles))
-                successful_url = url
-                break
-
-            except requests.exceptions.Timeout:
-                print("[TIMEOUT ERROR] Delta API ne response nahi diya.")
-            except requests.exceptions.ConnectionError as e:
-                print("[CONNECTION ERROR]", e)
-            except requests.exceptions.RequestException as e:
-                print("[REQUEST ERROR]", e)
+                if candles and isinstance(candles, list) and len(candles) > 0:
+                    successful_url = url
+                    break
             except Exception as e:
-                print("[UNEXPECTED API ERROR]")
-                print(type(e).__name__, ":", e)
+                print(f"[API ATTEMPT ERROR] {e}")
+                continue
 
-        if candles is None:
-            print("\n" + "!" * 60)
-            print("[MARKET DATA FAILED]")
-            print("Kisi bhi Delta endpoint se candle data nahi mila.")
-            print("SYMBOL:", SYMBOL)
-            print("Tried BASE URLs:", base_urls)
-            print("!" * 60)
+        if not candles:
+            print("[MARKET ERROR] Candles data bilkul mali nathi rahyo.")
             return None
 
         df = pd.DataFrame(candles)
-        print("[DATAFRAME COLUMNS]", df.columns.tolist())
-
-        if df.empty:
-            print("[DATA ERROR] DataFrame empty hai.")
-            return None
-
         rename_map = {
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume"
+            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
         }
         df = df.rename(columns=rename_map)
 
         required_columns = ["open", "high", "low", "close", "volume"]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-
-        if missing_columns:
-            print("\n" + "!" * 60)
-            print("[DATA ERROR] Required columns missing.")
-            print("MISSING :", missing_columns)
-            print("RECEIVED:", df.columns.tolist())
-            print("!" * 60)
-            return None
-
         for col in required_columns:
+            if col not in df.columns:
+                return None
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        before = len(df)
         df = df.dropna(subset=required_columns).copy()
-        removed = before - len(df)
-
-        if removed > 0:
-            print(f"[DATA WARNING] {removed} invalid candle rows removed.")
 
         if "time" in df.columns:
             df["time"] = pd.to_numeric(df["time"], errors="coerce")
@@ -306,40 +226,10 @@ def fetch_market_data():
             df = df.drop_duplicates(subset=["time"], keep="last")
 
         df = df.reset_index(drop=True)
-        candle_count = len(df)
-
-        print("\n" + "=" * 60)
-        print("[CANDLE DATA RESULT]")
-        print("API       :", successful_url)
-        print("Candles   :", candle_count)
-        print("Symbol    :", SYMBOL)
-        print("Resolution: 15m")
-        print("=" * 60)
-
-        MIN_CANDLES = 100
-        if candle_count < MIN_CANDLES:
-            print("\n" + "!" * 60)
-            print("[INSUFFICIENT DATA]")
-            print(f"Required : {MIN_CANDLES}")
-            print(f"Received : {candle_count}")
-            print("Reason   : Strategy ke liye enough candles nahi hain.")
-            print("!" * 60)
-            return None
-
-        print("[LAST CLOSE]", df["close"].iloc[-1])
-        print("[LAST HIGH] ", df["high"].iloc[-1])
-        print("[LAST LOW]  ", df["low"].iloc[-1])
-        print("[VOLUME]    ", df["volume"].iloc[-1])
-        print("[MARKET DATA OK]")
-
         return df
 
     except Exception as e:
-        print("\n" + "!" * 60)
-        print("[FETCH MARKET DATA CRITICAL ERROR]")
-        print("TYPE :", type(e).__name__)
-        print("ERROR:", str(e))
-        print("!" * 60)
+        print(f"[FETCH ERROR] {e}")
         return None
 
 def fetch_order_book_metrics():
@@ -451,12 +341,12 @@ def build_ai_pipeline():
 def train_and_save_ai_brain():
     print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che...")
     df = fetch_market_data()
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 30:
         return None
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 80:
+    if len(df_clean) < 25:
         return None
 
     X = df_clean[FEATURES][:-1]
@@ -495,21 +385,19 @@ def calculate_contracts(balance, leverage, entry_price):
 # 8. PREDICTION ENGINE
 # =========================================================
 def predict_signal(df):
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 50:
+    if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
-    # Priority 1: Institutional Sweep
     inst_signal = check_institutional_sweep(df_clean)
     if inst_signal:
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
 
-    # Priority 2: Persistent AI Brain
     pipeline = get_or_load_ai_brain()
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
@@ -576,3 +464,58 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         res = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=10)
         return res.json()
     except Exception as e:
+        print(f"[ORDER ERROR] {e}")
+        return {"error": str(e)}
+
+# =========================================================
+# 10. FLASK ROUTES & SCHEDULER
+# =========================================================
+@app.route("/", methods=["GET"])
+@app.route("/execute-trade", methods=["GET"])
+def execute_trade():
+    df = fetch_market_data()
+    action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
+    balance = get_available_balance()
+    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
+
+    if action in ["BUY", "SELL"]:
+        contracts = calculate_contracts(balance, leverage, latest_close)
+        if balance <= 0 and not DRY_RUN:
+            return jsonify({
+                "status": "FAILED_NO_BALANCE",
+                "strategy": strategy_tag,
+                "action": action,
+                "confidence": f"{conf*100:.2f}%",
+                "balance": f"₹{balance:.2f}"
+            }), 200
+
+        order_res = place_order_with_brackets(action, contracts, sl, tp)
+        return jsonify({
+            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
+            "action": action,
+            "confidence": f"{conf*100:.2f}%",
+            "contracts": contracts,
+            "leverage": f"{leverage}x",
+            "stop_loss": sl,
+            "take_profit": tp,
+            "strategy": strategy_tag,
+            "delta_response": order_res
+        }), 200
+
+    return jsonify({
+        "status": "WAIT_AND_SEE",
+        "action": "HOLD",
+        "confidence": f"{conf*100:.2f}%",
+        "strategy": strategy_tag,
+        "balance": f"₹{balance:.2f}"
+    }), 200
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
+scheduler.start()
+
+if __name__ == "__main__":
+    if not os.path.exists(MODEL_FILE):
+        train_and_save_ai_brain()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
