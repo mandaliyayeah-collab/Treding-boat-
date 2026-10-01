@@ -84,7 +84,13 @@ def get_headers(method, path, query="", payload=""):
 # 1. MEMORY ENGINE
 # =========================================================
 def default_memory():
-    return {"loss_penalty": 0.0, "total_trades": 0, "losses": 0, "wins": 0}
+    return {
+        "loss_penalty": 0.0,
+        "total_trades": 0,
+        "losses": 0,
+        "wins": 0,
+        "open_position": None
+    }
 
 def load_memory():
     if not os.path.exists(MEMORY_FILE):
@@ -241,6 +247,22 @@ def fetch_market_data():
         print(f"[FETCH ERROR] {e}")
         return None
 
+def fetch_funding_rate():
+    endpoints = [
+        f"{BASE_URL}/v2/tickers/{SYMBOL}",
+        f"https://api.india.delta.exchange/v2/tickers/{SYMBOL}",
+        f"https://api.delta.exchange/v2/tickers/{SYMBOL}"
+    ]
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5)
+            data = res.json()
+            if data.get("success"):
+                return float(data.get("result", {}).get("funding_rate", 0.0))
+        except Exception:
+            continue
+    return 0.0
+
 def fetch_order_book_metrics():
     endpoints = [
         f"{BASE_URL}/v2/l2orderbook/{SYMBOL}",
@@ -333,16 +355,17 @@ def check_institutional_sweep(df):
         return None
 
     obi_ratio, _, _ = fetch_order_book_metrics()
+    funding_rate = fetch_funding_rate()
     tick_size = get_product_specs()["tick_size"]
 
     if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
-        if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
+        if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20 and funding_rate < 0.04:
             sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
             tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
             return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
 
     if latest["high"] > latest["recent_high"] and latest["close"] < latest["recent_high"]:
-        if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
+        if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20 and funding_rate > -0.04:
             sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
             tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
             return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
@@ -393,7 +416,33 @@ def get_or_load_ai_brain():
     return train_and_save_ai_brain()
 
 # =========================================================
-# 7. POSITION SIZING
+# 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN TRAILING)
+# =========================================================
+def update_dynamic_risk_management(current_price):
+    memory = load_memory()
+    pos = memory.get("open_position")
+    if not pos:
+        return
+
+    side = pos.get("side")
+    entry = float(pos.get("entry", 0))
+    sl = float(pos.get("sl", 0))
+    r_unit = abs(entry - sl)
+    if r_unit <= 0:
+        return
+
+    if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
+        pos["sl"] = entry
+        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL set to: {entry}")
+    elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
+        pos["sl"] = entry
+        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL set to: {entry}")
+
+    memory["open_position"] = pos
+    save_memory(memory)
+
+# =========================================================
+# 8. POSITION SIZING
 # =========================================================
 def calculate_contracts(balance, leverage, entry_price):
     specs = get_product_specs()
@@ -408,7 +457,7 @@ def calculate_contracts(balance, leverage, entry_price):
     return max(1, int(notional / contract_notional))
 
 # =========================================================
-# 8. PREDICTION ENGINE
+# 9. PREDICTION ENGINE
 # =========================================================
 def predict_signal(df):
     if df is None or len(df) < 30:
@@ -418,6 +467,12 @@ def predict_signal(df):
     df_clean = df.dropna(subset=FEATURES).copy()
     if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
+
+    latest = df_clean.iloc[-1]
+    chop = float(latest["chop_index"])
+    adx = float(latest["adx"])
+    if chop > 61.8 and adx < 20:
+        return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
 
     inst_signal = check_institutional_sweep(df_clean)
     if inst_signal:
@@ -443,11 +498,12 @@ def predict_signal(df):
     threshold = min(0.90, CONFIDENCE_BASE_THRESHOLD + memory.get("loss_penalty", 0.0))
     current_atr = float(df_clean["atr"].iloc[-1])
     latest_close = float(df_clean["close"].iloc[-1])
+    funding_rate = fetch_funding_rate()
 
-    if prob_up >= threshold:
+    if prob_up >= threshold and funding_rate < 0.035:
         action = "BUY"
         conf = prob_up
-    elif prob_down >= threshold:
+    elif prob_down >= threshold and funding_rate > -0.035:
         action = "SELL"
         conf = prob_down
     else:
@@ -470,7 +526,7 @@ def predict_signal(df):
     return (action, conf, sl, tp, leverage, f"AI_BRAIN (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})")
 
 # =========================================================
-# 9. ORDER EXECUTION
+# 10. ORDER EXECUTION
 # =========================================================
 def place_order_with_brackets(action, size, stop_loss, take_profit):
     if DRY_RUN:
@@ -494,15 +550,20 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         return {"error": str(e)}
 
 # =========================================================
-# 10. FLASK ROUTES & SCHEDULER
+# 11. FLASK ROUTES & SCHEDULER
 # =========================================================
 @app.route("/", methods=["GET"])
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
     df = fetch_market_data()
+    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
+
+    if latest_close > 0:
+        update_dynamic_risk_management(latest_close)
+
     action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
     balance = get_available_balance()
-    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
+    funding = fetch_funding_rate()
 
     if action in ["BUY", "SELL"]:
         contracts = calculate_contracts(balance, leverage, latest_close)
@@ -516,32 +577,5 @@ def execute_trade():
             }), 200
 
         order_res = place_order_with_brackets(action, contracts, sl, tp)
-        return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "action": action,
-            "confidence": f"{conf*100:.2f}%",
-            "contracts": contracts,
-            "leverage": f"{leverage}x",
-            "stop_loss": sl,
-            "take_profit": tp,
-            "strategy": strategy_tag,
-            "delta_response": order_res
-        }), 200
 
-    return jsonify({
-        "status": "WAIT_AND_SEE",
-        "action": "HOLD",
-        "confidence": f"{conf*100:.2f}%",
-        "strategy": strategy_tag,
-        "balance": f"₹{balance:.2f}"
-    }), 200
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
-scheduler.start()
-
-if __name__ == "__main__":
-    if not os.path.exists(MODEL_FILE):
-        train_and_save_ai_brain()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-            
+        memory = l
