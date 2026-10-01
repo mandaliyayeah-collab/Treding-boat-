@@ -504,29 +504,53 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
     df = fetch_market_data()
-    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
+
+    latest_close = (
+        float(df["close"].iloc[-1])
+        if df is not None and not df.empty
+        else 0.0
+    )
 
     if latest_close > 0:
         update_dynamic_risk_management(latest_close)
 
     action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
+
     balance = get_available_balance()
     funding = fetch_funding_rate()
 
+    # =====================================================
+    # BUY / SELL
+    # =====================================================
     if action in ["BUY", "SELL"]:
-        contracts = calculate_contracts(balance, leverage, latest_close)
+
+        contracts = calculate_contracts(
+            balance,
+            leverage,
+            latest_close
+        )
+
+        # No balance protection
         if balance <= 0 and not DRY_RUN:
             return jsonify({
                 "status": "FAILED_NO_BALANCE",
                 "strategy": strategy_tag,
                 "action": action,
-                "confidence": f"{conf*100:.2f}%",
+                "confidence": f"{conf * 100:.2f}%",
                 "balance": f"₹{balance:.2f}"
             }), 200
 
-        order_res = place_order_with_brackets(action, contracts, sl, tp)
+        # Place order
+        order_res = place_order_with_brackets(
+            action,
+            contracts,
+            sl,
+            tp
+        )
 
+        # Save position memory
         memory = load_memory()
+
         memory["open_position"] = {
             "side": action,
             "entry": latest_close,
@@ -535,22 +559,14 @@ def execute_trade():
             "max_price": latest_close,
             "min_price": latest_close
         }
+
         save_memory(memory)
 
+        # Response
         return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "action": action,
-            "confidence": f"{conf*100:.2f}%",
-            "contracts": contracts,
-            "leverage": f"{leverage}x",
-            "entry": latest_close,
-            "stop_loss": sl,
-            "take_profit": tp,
-            "funding_rate": f"{funding*100:.4f}%",
-            "strategy": strategy_tag,
-            "delta_response": order_res
-        }), 200
-
-    return jsonify({
-        "status": "WAIT_AND_SEE",
-        "action
+            "status": (
+                "ORDER_PLACED"
+                if not DRY_RUN
+                else "SIMULATED_ORDER"
+            ),
+            "a
