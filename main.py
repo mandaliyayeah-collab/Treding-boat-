@@ -550,7 +550,7 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
-# =========================================================
+        # =========================================================
 # 11. FLASK ROUTES & SCHEDULER
 # =========================================================
 @app.route("/", methods=["GET"])
@@ -579,7 +579,7 @@ def execute_trade():
 
         order_res = place_order_with_brackets(action, contracts, sl, tp)
 
-                memory = load_memory()
+        memory = load_memory()
         memory["open_position"] = {
             "side": action,
             "entry": latest_close,
