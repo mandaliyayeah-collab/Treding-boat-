@@ -78,7 +78,7 @@ def default_memory():
         "total_trades": 0,
         "losses": 0,
         "wins": 0,
-        "open_position": None  # Structure: {side, entry, sl, tp, max_price, min_price}
+        "open_position": None
     }
 
 def load_memory():
@@ -198,11 +198,6 @@ def fetch_market_data():
 # 1. ADVANCED QUANT: FUNDING RATE & ORDER BOOK
 # =========================================================
 def fetch_funding_rate():
-    """
-    Returns current funding rate for BTCUSD.
-    Extreme positive (> 0.03%) = Long crowd trap
-    Extreme negative (< -0.03%) = Short crowd trap
-    """
     endpoints = [
         f"{BASE_URL}/v2/tickers/{SYMBOL}",
         f"https://api.india.delta.exchange/v2/tickers/{SYMBOL}",
@@ -214,8 +209,7 @@ def fetch_funding_rate():
             data = res.json()
             if data.get("success"):
                 ticker = data.get("result", {})
-                rate = float(ticker.get("funding_rate", 0.0))
-                return rate
+                return float(ticker.get("funding_rate", 0.0))
         except Exception:
             continue
     return 0.0
@@ -253,35 +247,30 @@ def add_indicators(df):
     df["ma25"] = df["close"].rolling(25).mean()
     df["return"] = df["close"].pct_change()
 
-    # True Range & ATR
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean()
 
-    # RSI
     delta = df["close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # Candle wicks
     candle_range = (df["high"] - df["low"]).replace(0, 1e-9)
     body_low = df[["open", "close"]].min(axis=1)
     body_high = df[["open", "close"]].max(axis=1)
     df["lower_wick_ratio"] = (body_low - df["low"]) / candle_range
     df["upper_wick_ratio"] = (df["high"] - body_high) / candle_range
 
-    # Volume & Norm ATR
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     df["vol_surge"] = df["volume"] / (df["vol_ma20"] + 1e-9)
     df["norm_atr"] = df["atr"] / (df["close"] + 1e-9)
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
 
-    # Directional Movement & ADX (Trend Strength)
     up_move = df["high"] - df["high"].shift(1)
     down_move = df["low"].shift(1) - df["low"]
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
@@ -292,13 +281,11 @@ def add_indicators(df):
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
     df["adx"] = dx.rolling(14).mean()
 
-    # Choppiness Index (Range vs Trend Detector)
     sum_tr = tr.rolling(14).sum()
     max_high = df["high"].rolling(14).max()
     min_low = df["low"].rolling(14).min()
     df["chop_index"] = 100 * (np.log10(sum_tr / (max_high - min_low + 1e-9)) / np.log10(14))
 
-    # Support / Resistance & Target
     df["recent_low"] = df["low"].shift(1).rolling(20).min()
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
     df["target"] = np.where(df["close"].shift(-1) > df["close"], 1, 0)
@@ -319,15 +306,13 @@ def check_institutional_sweep(df):
     funding_rate = fetch_funding_rate()
     tick_size = get_product_specs()["tick_size"]
 
-    # Bullish Trap: Support broken + Strong Bids + Funding not heavily overheated
     if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
         if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
-            if funding_rate < 0.04:  # Avoid entering if long crowd is hyper-leveraged
+            if funding_rate < 0.04:
                 sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
                 tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
                 return ("BUY", 0.94, sl, tp, "INSTITUTIONAL_LIQUIDITY_HUNT_BUY")
 
-    # Bearish Trap: Resistance broken + Strong Asks + Funding not heavily negative
     if latest["high"] > latest["recent_high"] and latest["close"] < latest["recent_high"]:
         if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20:
             if funding_rate > -0.04:
@@ -382,10 +367,6 @@ def get_or_load_ai_brain():
 # 5. DYNAMIC TRAILING STOP & BREAK-EVEN ENGINE
 # =========================================================
 def update_dynamic_risk_management(current_price):
-    """
-    Monitors active positions, shifts SL to Break-Even when +1.5R reached,
-    and trails profits using ATR Chandelier Logic.
-    """
     memory = load_memory()
     pos = memory.get("open_position")
     if not pos:
@@ -396,18 +377,15 @@ def update_dynamic_risk_management(current_price):
     sl = float(pos.get("sl", 0))
     r_unit = abs(entry - sl)
 
-    # 1. Break-Even Check: If profit >= 1.5 * Risk, move SL to Entry Price
     if side == "BUY":
         if current_price >= entry + (1.5 * r_unit) and sl < entry:
             pos["sl"] = entry
             print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL updated to Entry: {entry}")
-        # Update high-water mark
         pos["max_price"] = max(pos.get("max_price", current_price), current_price)
     elif side == "SELL":
         if current_price <= entry - (1.5 * r_unit) and sl > entry:
             pos["sl"] = entry
             print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL updated to Entry: {entry}")
-        # Update low-water mark
         pos["min_price"] = min(pos.get("min_price", current_price), current_price)
 
     memory["open_position"] = pos
@@ -441,18 +419,14 @@ def predict_signal(df):
     chop = float(latest["chop_index"])
     adx = float(latest["adx"])
 
-    # MARKET REGIME FILTER:
-    # If Market is hyper choppy (Chop > 61.8) and No Trend (ADX < 20), prevent standard AI breakout
     if chop > 61.8 and adx < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
 
-    # Priority 1: Institutional Sweep
     inst_signal = check_institutional_sweep(df_clean)
     if inst_signal:
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
 
-    # Priority 2: AI Brain Pipeline
     pipeline = get_or_load_ai_brain()
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
@@ -474,12 +448,9 @@ def predict_signal(df):
     latest_close = float(df_clean["close"].iloc[-1])
     funding_rate = fetch_funding_rate()
 
-    # SENTIMENT FILTER:
-    # Do not buy if funding is overheated (> 0.035%)
     if prob_up >= threshold and funding_rate < 0.035:
         action = "BUY"
         conf = prob_up
-    # Do not sell if funding is over-dumped (< -0.035%)
     elif prob_down >= threshold and funding_rate > -0.035:
         action = "SELL"
         conf = prob_down
@@ -532,7 +503,6 @@ def execute_trade():
     df = fetch_market_data()
     latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
 
-    # Dynamic trailing check on active position
     if latest_close > 0:
         update_dynamic_risk_management(latest_close)
 
@@ -541,4 +511,45 @@ def execute_trade():
     funding = fetch_funding_rate()
 
     if action in ["BUY", "SELL"]:
-        contracts = calculate_contracts(balance, leverage, latest_clo
+        contracts = calculate_contracts(balance, leverage, latest_close)
+        if balance <= 0 and not DRY_RUN:
+            return jsonify({
+                "status": "FAILED_NO_BALANCE",
+                "strategy": strategy_tag,
+                "action": action,
+                "confidence": f"{conf*100:.2f}%",
+                "balance": f"₹{balance:.2f}"
+            }), 200
+
+        order_res = place_order_with_brackets(action, contracts, sl, tp)
+
+        memory = load_memory()
+        memory["open_position"] = {
+            "side": action,
+            "entry": latest_close,
+            "sl": sl,
+            "tp": tp,
+            "max_price": latest_close,
+            "min_price": latest_close
+        }
+        save_memory(memory)
+
+        return jsonify({
+            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
+            "action": action,
+            "confidence": f"{conf*100:.2f}%",
+            "contracts": contracts,
+            "leverage": f"{leverage}x",
+            "entry": latest_close,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "funding_rate": f"{funding*100:.4f}%",
+            "strategy": strategy_tag,
+            "delta_response": order_res
+        }), 200
+
+    return jsonify({
+        "status": "WAIT_AND_SEE",
+        "action": "HOLD",
+        "confidence": f"{conf*100:.2f}%",
+        "funding_rate": f"{funding*100:.4f}%"
