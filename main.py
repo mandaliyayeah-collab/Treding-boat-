@@ -29,7 +29,8 @@ API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 SYMBOL = "BTCUSD"
 PRODUCT_ID = 27
 
-MODEL_FILE = "ai_brain_model.pkl"
+MODEL_FILE = "ai_brain_model_v2.pkl"
+
 MEMORY_FILE = "trade_memory.json"
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
