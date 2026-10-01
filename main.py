@@ -122,7 +122,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 # =========================================================
-# 3. WALLET BALANCE & MARKET DATA (MULTI-ENDPOINT FIX)
+# 3. WALLET BALANCE & MARKET DATA
 # =========================================================
 def get_available_balance():
     try:
@@ -144,34 +144,203 @@ def get_available_balance():
         return 0.0
 
 def fetch_market_data():
-    endpoints = [
-        f"{BASE_URL}/v2/chart/history?symbol={SYMBOL}&resolution=15",
-        f"https://api.india.delta.exchange/v2/chart/history?symbol={SYMBOL}&resolution=15",
-        f"https://api.delta.exchange/v2/chart/history?symbol={SYMBOL}&resolution=15"
-    ]
-    
-    candles = None
-    for url in endpoints:
-        try:
-            res = requests.get(url, timeout=7)
-            res_json = res.json()
-            if res_json.get("result") and len(res_json.get("result")) > 0:
-                candles = res_json.get("result")
+    """
+    Fetch 15-minute candle data from Delta Exchange.
+    No silent failures:
+    Every important error is printed with exact reason.
+    """
+    try:
+        now = int(time.time())
+        lookback_seconds = 120 * 15 * 60
+        start_time = now - lookback_seconds
+
+        base_urls = []
+        if BASE_URL:
+            base_urls.append(BASE_URL.rstrip("/"))
+
+        india_url = "https://api.india.delta.exchange"
+        if india_url not in base_urls:
+            base_urls.append(india_url)
+
+        global_url = "https://api.delta.exchange"
+        if global_url not in base_urls:
+            base_urls.append(global_url)
+
+        base_urls = list(dict.fromkeys(base_urls))
+
+        candles = None
+        successful_url = None
+
+        for base in base_urls:
+            url = f"{base}/v2/history/candles"
+            params = {
+                "resolution": "15m",
+                "symbol": SYMBOL,
+                "start": start_time,
+                "end": now
+            }
+
+            print("\n" + "=" * 60)
+            print("[CANDLE REQUEST]")
+            print("URL      :", url)
+            print("SYMBOL   :", SYMBOL)
+            print("START    :", start_time)
+            print("END      :", now)
+            print("RESOLUTION: 15m")
+
+            try:
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=15,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "TradingBot/1.0"
+                    }
+                )
+
+                print("[HTTP STATUS]", response.status_code)
+
+                if response.status_code != 200:
+                    print("[HTTP ERROR]")
+                    print(response.text[:1000])
+                    continue
+
+                try:
+                    data = response.json()
+                except ValueError as json_error:
+                    print("[JSON ERROR]", json_error)
+                    print("[RAW RESPONSE]")
+                    print(response.text[:1000])
+                    continue
+
+                print("[API SUCCESS FIELD]", data.get("success"))
+
+                if data.get("success") is False:
+                    print("[DELTA API ERROR]")
+                    print(data)
+                    continue
+
+                candles = data.get("result")
+
+                if candles is None:
+                    print("[DATA ERROR] 'result' field missing.")
+                    print("[FULL RESPONSE]")
+                    print(data)
+                    continue
+
+                if not isinstance(candles, list):
+                    print("[DATA ERROR] result is not a list.")
+                    print("[RESULT TYPE]", type(candles))
+                    print("[RESULT]", candles)
+                    continue
+
+                if len(candles) == 0:
+                    print("[DATA ERROR] API returned ZERO candles.")
+                    continue
+
+                print("[RAW CANDLES RECEIVED]", len(candles))
+                successful_url = url
                 break
-        except Exception:
-            continue
 
-    if not candles:
-        print("[MARKET ERROR] Candles data empty aavyo.")
-        return None
+            except requests.exceptions.Timeout:
+                print("[TIMEOUT ERROR] Delta API ne response nahi diya.")
+            except requests.exceptions.ConnectionError as e:
+                print("[CONNECTION ERROR]", e)
+            except requests.exceptions.RequestException as e:
+                print("[REQUEST ERROR]", e)
+            except Exception as e:
+                print("[UNEXPECTED API ERROR]")
+                print(type(e).__name__, ":", e)
 
-    df = pd.DataFrame(candles)
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
+        if candles is None:
+            print("\n" + "!" * 60)
+            print("[MARKET DATA FAILED]")
+            print("Kisi bhi Delta endpoint se candle data nahi mila.")
+            print("SYMBOL:", SYMBOL)
+            print("Tried BASE URLs:", base_urls)
+            print("!" * 60)
+            return None
+
+        df = pd.DataFrame(candles)
+        print("[DATAFRAME COLUMNS]", df.columns.tolist())
+
+        if df.empty:
+            print("[DATA ERROR] DataFrame empty hai.")
+            return None
+
+        rename_map = {
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume"
+        }
+        df = df.rename(columns=rename_map)
+
+        required_columns = ["open", "high", "low", "close", "volume"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            print("\n" + "!" * 60)
+            print("[DATA ERROR] Required columns missing.")
+            print("MISSING :", missing_columns)
+            print("RECEIVED:", df.columns.tolist())
+            print("!" * 60)
+            return None
+
+        for col in required_columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna().reset_index(drop=True)
-    return df
+        before = len(df)
+        df = df.dropna(subset=required_columns).copy()
+        removed = before - len(df)
+
+        if removed > 0:
+            print(f"[DATA WARNING] {removed} invalid candle rows removed.")
+
+        if "time" in df.columns:
+            df["time"] = pd.to_numeric(df["time"], errors="coerce")
+            df = df.dropna(subset=["time"])
+            df = df.sort_values("time")
+            df = df.drop_duplicates(subset=["time"], keep="last")
+
+        df = df.reset_index(drop=True)
+        candle_count = len(df)
+
+        print("\n" + "=" * 60)
+        print("[CANDLE DATA RESULT]")
+        print("API       :", successful_url)
+        print("Candles   :", candle_count)
+        print("Symbol    :", SYMBOL)
+        print("Resolution: 15m")
+        print("=" * 60)
+
+        MIN_CANDLES = 100
+        if candle_count < MIN_CANDLES:
+            print("\n" + "!" * 60)
+            print("[INSUFFICIENT DATA]")
+            print(f"Required : {MIN_CANDLES}")
+            print(f"Received : {candle_count}")
+            print("Reason   : Strategy ke liye enough candles nahi hain.")
+            print("!" * 60)
+            return None
+
+        print("[LAST CLOSE]", df["close"].iloc[-1])
+        print("[LAST HIGH] ", df["high"].iloc[-1])
+        print("[LAST LOW]  ", df["low"].iloc[-1])
+        print("[VOLUME]    ", df["volume"].iloc[-1])
+        print("[MARKET DATA OK]")
+
+        return df
+
+    except Exception as e:
+        print("\n" + "!" * 60)
+        print("[FETCH MARKET DATA CRITICAL ERROR]")
+        print("TYPE :", type(e).__name__)
+        print("ERROR:", str(e))
+        print("!" * 60)
+        return None
 
 def fetch_order_book_metrics():
     endpoints = [
@@ -282,12 +451,12 @@ def build_ai_pipeline():
 def train_and_save_ai_brain():
     print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che...")
     df = fetch_market_data()
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 100:
         return None
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 25:
+    if len(df_clean) < 80:
         return None
 
     X = df_clean[FEATURES][:-1]
@@ -326,12 +495,12 @@ def calculate_contracts(balance, leverage, entry_price):
 # 8. PREDICTION ENGINE
 # =========================================================
 def predict_signal(df):
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 100:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 20:
+    if len(df_clean) < 50:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
     # Priority 1: Institutional Sweep
@@ -407,59 +576,3 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         res = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=10)
         return res.json()
     except Exception as e:
-        print(f"[ORDER ERROR] {e}")
-        return {"error": str(e)}
-
-# =========================================================
-# 10. FLASK ROUTES & SCHEDULER
-# =========================================================
-@app.route("/", methods=["GET"])
-@app.route("/execute-trade", methods=["GET"])
-def execute_trade():
-    df = fetch_market_data()
-    action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
-    balance = get_available_balance()
-    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
-
-    if action in ["BUY", "SELL"]:
-        contracts = calculate_contracts(balance, leverage, latest_close)
-        if balance <= 0 and not DRY_RUN:
-            return jsonify({
-                "status": "FAILED_NO_BALANCE",
-                "strategy": strategy_tag,
-                "action": action,
-                "confidence": f"{conf*100:.2f}%",
-                "balance": f"₹{balance:.2f}"
-            }), 200
-
-        order_res = place_order_with_brackets(action, contracts, sl, tp)
-        return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "action": action,
-            "confidence": f"{conf*100:.2f}%",
-            "contracts": contracts,
-            "leverage": f"{leverage}x",
-            "stop_loss": sl,
-            "take_profit": tp,
-            "strategy": strategy_tag,
-            "delta_response": order_res
-        }), 200
-
-    return jsonify({
-        "status": "WAIT_AND_SEE",
-        "action": "HOLD",
-        "confidence": f"{conf*100:.2f}%",
-        "strategy": strategy_tag,
-        "balance": f"₹{balance:.2f}"
-    }), 200
-
-# Dar Ravivare ratre 12:00 vage auto-retrain thase
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
-scheduler.start()
-
-if __name__ == "__main__":
-    if not os.path.exists(MODEL_FILE):
-        train_and_save_ai_brain()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
