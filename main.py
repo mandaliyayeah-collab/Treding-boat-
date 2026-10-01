@@ -37,11 +37,12 @@ CONFIDENCE_BASE_THRESHOLD = 0.60
 MARGIN_ALLOCATION_PERCENT = 0.05
 MAX_LEVERAGE = 5
 
-FEATURES = [
+FEATURES =FEATURES = [
     "return", "ma7", "ma25", "volume", "atr", "rsi",
     "lower_wick_ratio", "upper_wick_ratio", "vol_surge",
     "norm_atr", "wick_skew", "dist_ma25", "adx", "chop_index"
 ]
+
 
 ]
 
