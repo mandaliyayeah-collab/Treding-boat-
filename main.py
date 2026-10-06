@@ -26,7 +26,7 @@ BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.india.delta.exchange")
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 
-# ૫ નંબર: મલ્ટી-પેર સપોર્ટ (BTCUSD અને ETHUSD)
+# મલ્ટી-પેર સપોર્ટ (BTCUSD અને ETHUSD)
 PAIRS = {
     "BTCUSD": {"product_id": 27, "model_file": "ai_brain_btc_v2.pkl"},
     "ETHUSD": {"product_id": 29, "model_file": "ai_brain_eth_v2.pkl"}
@@ -201,7 +201,7 @@ def cancel_all_open_orders(product_id=None):
     except Exception as e:
         print(f"[CANCEL ALL ERROR] {e}")
 
-# ૪ નંબર: છેલ્લી 1500 કેન્ડલ્સ (~15 દિવસ) સુધીનો ડેટાસેટ વોક-ફોરવર્ડ ટ્રેઇનિંગ માટે ફેચ કરશે
+# છેલ્લી 1500 કેન્ડલ્સ (~15 દિવસ) સુધીનો ડેટાસેટ વોક-ફોરવર્ડ ટ્રેઇનિંગ માટે ફેચ કરશે
 def fetch_market_data(symbol, limit_candles=1500):
     try:
         now = int(time.time())
@@ -420,7 +420,6 @@ def build_ai_pipeline():
 
 def train_and_save_ai_brain_for_pair(symbol, model_file):
     print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che ({symbol})...")
-    # ૧,૫૦૦ કેન્ડલ્સનો મોટો ડેટાસેટ વોક-ફોરવર્ડ એનાલિસિસ માટે
     df = fetch_market_data(symbol, limit_candles=1500)
     if df is None or len(df) < 100:
         return None
@@ -542,16 +541,20 @@ def predict_signal(symbol, df):
         else:
             prob_down = float(prob)
 
-    # ૪ નંબર: ડાયનેમિક પ્રોબેબિલિટી કેલિબ્રેશન (વોલેટિલિટી મુજબ થ્રેશોલ્ડ 0.60 થી 0.70 સેટ થશે)
+    # ડાયનેમિક પ્રોબેબિલિટી કેલિબ્રેશન (વોલેટિલિટી મુજબ થ્રેશોલ્ડ 0.60 થી 0.70 સેટ થશે)
     current_atr = float(completed_candle["atr"])
     latest_close = float(completed_candle["close"])
     norm_atr = current_atr / (latest_close + 1e-9)
 
     dynamic_confidence = CONFIDENCE_BASE_THRESHOLD
-    if norm_atr > 0.008:  # ઊંચી વોલેટિલિટીમાં કડક ફિલ્ટર
+    if norm_atr > 0.008:
         dynamic_confidence = 0.68
     elif norm_atr > 0.005:
         dynamic_confidence = 0.64
 
     memory = load_memory()
-    threshold = min(0.90, dynamic_confidence + memory.get("loss_penal
+    threshold = min(0.90, dynamic_confidence + memory.get("loss_penalty", 0.0))
+    funding_rate = fetch_funding_rate(symbol)
+
+    if prob_up >= threshold and funding_rate < 0.035:
+       
