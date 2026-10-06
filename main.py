@@ -756,10 +756,15 @@ def delayed_bot_startup():
             except Exception as err:
                 print(f"[BACKGROUND TRAIN ERROR] {err}")
 
-startup_thread = threading.Thread(target=delayed_bot_startup, daemon=True)
+startup_thread = threading.Thread(
+    target=delayed_bot_startup,
+    daemon=True
+)
 startup_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-    
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
