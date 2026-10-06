@@ -26,7 +26,6 @@ BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.india.delta.exchange")
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 
-# મલ્ટી-પેર સપોર્ટ (BTCUSD અને ETHUSD)
 PAIRS = {
     "BTCUSD": {"product_id": 27, "model_file": "ai_brain_btc_v2.pkl"},
     "ETHUSD": {"product_id": 29, "model_file": "ai_brain_eth_v2.pkl"}
@@ -167,7 +166,6 @@ def get_available_balance():
         return 0.0
 
 def get_live_position():
-    """ડેલ્ટા એક્સચેન્જ પરથી કોઈપણ એક્ટિવ પેરની ઓપન પોઝિશન તપાસે છે"""
     if DRY_RUN:
         memory = load_memory()
         return memory.get("open_position")
@@ -187,7 +185,6 @@ def get_live_position():
         return None
 
 def cancel_all_open_orders(product_id=None):
-    """પોઝિશન બંધ થતાં જૂના SL/TP ઓર્ડર્સ આપમેળે રદ કરે છે"""
     if DRY_RUN:
         return
     try:
@@ -201,7 +198,6 @@ def cancel_all_open_orders(product_id=None):
     except Exception as e:
         print(f"[CANCEL ALL ERROR] {e}")
 
-# છેલ્લી 1500 કેન્ડલ્સ (~15 દિવસ) સુધીનો ડેટાસેટ વોક-ફોરવર્ડ ટ્રેઇનિંગ માટે ફેચ કરશે
 def fetch_market_data(symbol, limit_candles=1500):
     try:
         now = int(time.time())
@@ -352,7 +348,6 @@ def add_indicators(df):
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
 
-    # ADX
     up = df["high"] - df["high"].shift(1)
     down = df["low"].shift(1) - df["low"]
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
@@ -363,7 +358,6 @@ def add_indicators(df):
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
     df["adx"] = dx.rolling(14).mean()
 
-    # Choppiness Index
     sum_tr = tr.rolling(14).sum()
     max_h = df["high"].rolling(14).max()
     min_l = df["low"].rolling(14).min()
@@ -401,160 +395,4 @@ def check_institutional_sweep(df, symbol):
             tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
             return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
 
-    return None
 
-# =========================================================
-# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING (WALK-FORWARD)
-# =========================================================
-def build_ai_pipeline():
-    return Pipeline([
-        ("scaler", RobustScaler()),
-        ("model", GradientBoostingClassifier(
-            n_estimators=150,
-            learning_rate=0.06,
-            max_depth=3,
-            subsample=0.85,
-            random_state=42
-        ))
-    ])
-
-def train_and_save_ai_brain_for_pair(symbol, model_file):
-    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che ({symbol})...")
-    df = fetch_market_data(symbol, limit_candles=1500)
-    if df is None or len(df) < 100:
-        return None
-
-    df = add_indicators(df)
-    df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 80:
-        return None
-
-    X = df_clean[FEATURES][:-1]
-    y = df_clean["target"][:-1]
-
-    pipeline = build_ai_pipeline()
-    pipeline.fit(X, y)
-    joblib.dump(pipeline, model_file)
-    print(f"[{datetime.now()}] [AI] Model save thai gayu: {model_file} with {len(X)} samples")
-    return pipeline
-
-def train_all_ai_brains():
-    for sym, config in PAIRS.items():
-        train_and_save_ai_brain_for_pair(sym, config["model_file"])
-
-def get_or_load_ai_brain(symbol):
-    model_file = PAIRS[symbol]["model_file"]
-    if os.path.exists(model_file):
-        try:
-            return joblib.load(model_file)
-        except Exception as e:
-            print(f"[AI LOAD ERROR {symbol}] {e}")
-    return train_and_save_ai_brain_for_pair(symbol, model_file)
-
-# =========================================================
-# 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN & TRAILING)
-# =========================================================
-def update_dynamic_risk_management(current_price):
-    active_pos = get_live_position()
-    memory = load_memory()
-    pos = memory.get("open_position")
-
-    if not active_pos and pos is not None and not DRY_RUN:
-        print("[RISK CONTROL] Position close thai gai che. Cleaning orders & memory...")
-        cancel_all_open_orders()
-        memory["open_position"] = None
-        save_memory(memory)
-        return
-
-    if not pos:
-        return
-
-    side = pos.get("side")
-    entry = float(pos.get("entry", 0))
-    sl = float(pos.get("sl", 0))
-    r_unit = abs(entry - sl)
-    if r_unit <= 0:
-        return
-
-    if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
-        pos["sl"] = entry
-        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL: {entry}")
-    elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
-        pos["sl"] = entry
-        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL: {entry}")
-
-    memory["open_position"] = pos
-    save_memory(memory)
-
-# =========================================================
-# 8. POSITION SIZING
-# =========================================================
-def calculate_contracts(symbol, balance, leverage, entry_price):
-    specs = get_product_specs(symbol)
-    contract_val = specs["contract_value"]
-    if balance <= 0 or entry_price <= 0:
-        return 0
-    margin = balance * MARGIN_ALLOCATION_PERCENT
-    notional = margin * leverage
-    contract_notional = entry_price * contract_val
-    if contract_notional <= 0:
-        return 0
-    return max(1, int(notional / contract_notional))
-
-# =========================================================
-# 9. PREDICTION ENGINE WITH DYNAMIC CONFIDENCE CALIBRATION
-# =========================================================
-def predict_signal(symbol, df):
-    if df is None or len(df) < 30:
-        return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
-
-    df = add_indicators(df)
-    df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 20:
-        return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
-
-    completed_candle = df_clean.iloc[-2]
-    chop = float(completed_candle["chop_index"])
-    adx = float(completed_candle["adx"])
-
-    # ચોપી માર્કેટ રેજીમ ફિલ્ટર
-    if chop > 61.8 and adx < 20:
-        return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
-
-    inst_signal = check_institutional_sweep(df_clean.iloc[:-1], symbol)
-    if inst_signal:
-        action, conf, sl, tp, tag = inst_signal
-        return (action, conf, sl, tp, 4, tag)
-
-    pipeline = get_or_load_ai_brain(symbol)
-    if pipeline is None:
-        return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
-
-    latest_features = df_clean[FEATURES].iloc[[-2]]
-    probabilities = pipeline.predict_proba(latest_features)[0]
-    classes = pipeline.named_steps["model"].classes_
-
-    prob_up, prob_down = 0.0, 0.0
-    for cls, prob in zip(classes, probabilities):
-        if int(cls) == 1:
-            prob_up = float(prob)
-        else:
-            prob_down = float(prob)
-
-    # ડાયનેમિક પ્રોબેબિલિટી કેલિબ્રેશન (વોલેટિલિટી મુજબ થ્રેશોલ્ડ 0.60 થી 0.70 સેટ થશે)
-    current_atr = float(completed_candle["atr"])
-    latest_close = float(completed_candle["close"])
-    norm_atr = current_atr / (latest_close + 1e-9)
-
-    dynamic_confidence = CONFIDENCE_BASE_THRESHOLD
-    if norm_atr > 0.008:
-        dynamic_confidence = 0.68
-    elif norm_atr > 0.005:
-        dynamic_confidence = 0.64
-
-    memory = load_memory()
-    threshold = min(0.90, dynamic_confidence + memory.get("loss_penalty", 0.0))
-    funding_rate = fetch_funding_rate(symbol)
-
-    if prob_up >= threshold and funding_rate < 0.035:
-       
