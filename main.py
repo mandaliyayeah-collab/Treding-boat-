@@ -20,16 +20,18 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 
 # =========================================================
-# CONFIGURATION
+# CONFIGURATION & MULTI-PAIR SETUP
 # =========================================================
 BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.india.delta.exchange")
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 
-SYMBOL = "BTCUSD"
-PRODUCT_ID = 27
+# ૫ નંબર: મલ્ટી-પેર સપોર્ટ (BTCUSD અને ETHUSD)
+PAIRS = {
+    "BTCUSD": {"product_id": 27, "model_file": "ai_brain_btc_v2.pkl"},
+    "ETHUSD": {"product_id": 29, "model_file": "ai_brain_eth_v2.pkl"}
+}
 
-MODEL_FILE = "ai_brain_model_v2.pkl"
 MEMORY_FILE = "trade_memory.json"
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
@@ -77,7 +79,7 @@ def get_headers(method, path, query="", payload=""):
         "timestamp": timestamp,
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "BTC-AI-Trading-Bot/1.0"
+        "User-Agent": "Crypto-AI-Trading-Bot/2.0"
     }
 
 # =========================================================
@@ -114,11 +116,12 @@ def save_memory(data):
 # =========================================================
 # 2. PRODUCT SPECS & TICK ROUNDING
 # =========================================================
-def get_product_specs():
+def get_product_specs(symbol):
     endpoints = [
-        f"{BASE_URL}/v2/products/{SYMBOL}",
-        f"https://api.delta.exchange/v2/products/{SYMBOL}"
+        f"{BASE_URL}/v2/products/{symbol}",
+        f"https://api.delta.exchange/v2/products/{symbol}"
     ]
+    default_vals = {"BTCUSD": {"val": 0.001, "tick": 0.5}, "ETHUSD": {"val": 0.01, "tick": 0.05}}
     for url in endpoints:
         try:
             res = requests.get(url, timeout=5, headers={"Accept": "application/json"})
@@ -126,12 +129,13 @@ def get_product_specs():
             if data.get("success") and data.get("result"):
                 product = data.get("result")
                 return {
-                    "contract_value": float(product.get("contract_value", 0.001)),
-                    "tick_size": float(product.get("tick_size", 0.5))
+                    "contract_value": float(product.get("contract_value", default_vals.get(symbol, {}).get("val", 0.001))),
+                    "tick_size": float(product.get("tick_size", default_vals.get(symbol, {}).get("tick", 0.5)))
                 }
         except Exception:
             continue
-    return {"contract_value": 0.001, "tick_size": 0.5}
+    fallback = default_vals.get(symbol, {"val": 0.001, "tick": 0.5})
+    return {"contract_value": fallback["val"], "tick_size": fallback["tick"]}
 
 def round_to_tick(price, tick_size):
     if tick_size <= 0:
@@ -143,7 +147,7 @@ def round_to_tick(price, tick_size):
 # =========================================================
 def get_available_balance():
     if DRY_RUN:
-        return 100000.0  # ટેસ્ટિંગ માટે ₹1,00,000 સિમ્યુલેટેડ બેલેન્સ
+        return 100000.0
     try:
         path = "/v2/wallet/balances"
         headers = get_headers("GET", path)
@@ -163,29 +167,45 @@ def get_available_balance():
         return 0.0
 
 def get_live_position():
-    """ડેલ્ટા એક્સચેન્જ પર લાઈવ ઓપન પોઝિશન ચેક કરે છે"""
+    """ડેલ્ટા એક્સચેન્જ પરથી કોઈપણ એક્ટિવ પેરની ઓપન પોઝિશન તપાસે છે"""
     if DRY_RUN:
         memory = load_memory()
         return memory.get("open_position")
     try:
-        path = f"/v2/positions?product_id={PRODUCT_ID}"
+        path = "/v2/positions"
         headers = get_headers("GET", path)
         res = requests.get(BASE_URL + path, headers=headers, timeout=10)
         data = res.json()
         if data.get("success") and data.get("result"):
-            pos = data.get("result")
-            size = float(pos.get("size", 0))
-            if abs(size) > 0:
-                return pos
+            for pos in data.get("result", []):
+                size = float(pos.get("size", 0))
+                if abs(size) > 0:
+                    return pos
         return None
     except Exception as e:
         print(f"[LIVE POSITION FETCH ERROR] {e}")
         return None
 
-def fetch_market_data():
+def cancel_all_open_orders(product_id=None):
+    """પોઝિશન બંધ થતાં જૂના SL/TP ઓર્ડર્સ આપમેળે રદ કરે છે"""
+    if DRY_RUN:
+        return
+    try:
+        targets = [product_id] if product_id else [info["product_id"] for info in PAIRS.values()]
+        for pid in targets:
+            path = "/v2/orders/all"
+            payload = json.dumps({"product_id": pid})
+            headers = get_headers("DELETE", path, payload=payload)
+            requests.delete(BASE_URL + path, headers=headers, data=payload, timeout=5)
+        print("[ORDER CLEANUP] All pending bracket orders cancelled.")
+    except Exception as e:
+        print(f"[CANCEL ALL ERROR] {e}")
+
+# ૪ નંબર: છેલ્લી 1500 કેન્ડલ્સ (~15 દિવસ) સુધીનો ડેટાસેટ વોક-ફોરવર્ડ ટ્રેઇનિંગ માટે ફેચ કરશે
+def fetch_market_data(symbol, limit_candles=1500):
     try:
         now = int(time.time())
-        lookback_seconds = 120 * 15 * 60
+        lookback_seconds = limit_candles * 15 * 60
         start_time = now - lookback_seconds
 
         base_urls = []
@@ -205,7 +225,7 @@ def fetch_market_data():
             url = f"{base}/v2/history/candles"
             params = {
                 "resolution": "15m",
-                "symbol": SYMBOL,
+                "symbol": symbol,
                 "start": start_time,
                 "end": now
             }
@@ -216,7 +236,7 @@ def fetch_market_data():
                     timeout=15,
                     headers={
                         "Accept": "application/json",
-                        "User-Agent": "TradingBot/1.0"
+                        "User-Agent": "TradingBot/2.0"
                     }
                 )
                 if response.status_code != 200:
@@ -228,17 +248,14 @@ def fetch_market_data():
                 if candles and isinstance(candles, list) and len(candles) > 0:
                     break
             except Exception as e:
-                print(f"[API ATTEMPT ERROR] {e}")
+                print(f"[API ATTEMPT ERROR {symbol}] {e}")
                 continue
 
         if not candles:
-            print("[MARKET ERROR] Candles data bilkul mali nathi rahyo.")
             return None
 
         df = pd.DataFrame(candles)
-        rename_map = {
-            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
-        }
+        rename_map = {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
         df = df.rename(columns=rename_map)
 
         required_columns = ["open", "high", "low", "close", "volume"]
@@ -258,14 +275,14 @@ def fetch_market_data():
         df = df.reset_index(drop=True)
         return df
     except Exception as e:
-        print(f"[FETCH ERROR] {e}")
+        print(f"[FETCH ERROR {symbol}] {e}")
         return None
 
-def fetch_funding_rate():
+def fetch_funding_rate(symbol):
     endpoints = [
-        f"{BASE_URL}/v2/tickers/{SYMBOL}",
-        f"https://api.india.delta.exchange/v2/tickers/{SYMBOL}",
-        f"https://api.delta.exchange/v2/tickers/{SYMBOL}"
+        f"{BASE_URL}/v2/tickers/{symbol}",
+        f"https://api.india.delta.exchange/v2/tickers/{symbol}",
+        f"https://api.delta.exchange/v2/tickers/{symbol}"
     ]
     for url in endpoints:
         try:
@@ -277,11 +294,11 @@ def fetch_funding_rate():
             continue
     return 0.0
 
-def fetch_order_book_metrics():
+def fetch_order_book_metrics(symbol):
     endpoints = [
-        f"{BASE_URL}/v2/l2orderbook/{SYMBOL}",
-        f"https://api.india.delta.exchange/v2/l2orderbook/{SYMBOL}",
-        f"https://api.delta.exchange/v2/l2orderbook/{SYMBOL}"
+        f"{BASE_URL}/v2/l2orderbook/{symbol}",
+        f"https://api.india.delta.exchange/v2/l2orderbook/{symbol}",
+        f"https://api.delta.exchange/v2/l2orderbook/{symbol}"
     ]
     for url in endpoints:
         try:
@@ -360,7 +377,7 @@ def add_indicators(df):
 # =========================================================
 # 5. WHALE-TRAP SCANNER
 # =========================================================
-def check_institutional_sweep(df):
+def check_institutional_sweep(df, symbol):
     if len(df) < 30:
         return None
     latest = df.iloc[-1]
@@ -368,9 +385,9 @@ def check_institutional_sweep(df):
     if not np.isfinite(atr) or atr <= 0:
         return None
 
-    obi_ratio, _, _ = fetch_order_book_metrics()
-    funding_rate = fetch_funding_rate()
-    tick_size = get_product_specs()["tick_size"]
+    obi_ratio, _, _ = fetch_order_book_metrics(symbol)
+    funding_rate = fetch_funding_rate(symbol)
+    tick_size = get_product_specs(symbol)["tick_size"]
 
     if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
         if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20 and funding_rate < 0.04:
@@ -387,7 +404,7 @@ def check_institutional_sweep(df):
     return None
 
 # =========================================================
-# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING
+# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING (WALK-FORWARD)
 # =========================================================
 def build_ai_pipeline():
     return Pipeline([
@@ -401,15 +418,16 @@ def build_ai_pipeline():
         ))
     ])
 
-def train_and_save_ai_brain():
-    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che...")
-    df = fetch_market_data()
-    if df is None or len(df) < 30:
+def train_and_save_ai_brain_for_pair(symbol, model_file):
+    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che ({symbol})...")
+    # ૧,૫૦૦ કેન્ડલ્સનો મોટો ડેટાસેટ વોક-ફોરવર્ડ એનાલિસિસ માટે
+    df = fetch_market_data(symbol, limit_candles=1500)
+    if df is None or len(df) < 100:
         return None
 
     df = add_indicators(df)
     df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 25:
+    if len(df_clean) < 80:
         return None
 
     X = df_clean[FEATURES][:-1]
@@ -417,17 +435,22 @@ def train_and_save_ai_brain():
 
     pipeline = build_ai_pipeline()
     pipeline.fit(X, y)
-    joblib.dump(pipeline, MODEL_FILE)
-    print(f"[{datetime.now()}] [AI] Model save thai gayu: {MODEL_FILE}")
+    joblib.dump(pipeline, model_file)
+    print(f"[{datetime.now()}] [AI] Model save thai gayu: {model_file} with {len(X)} samples")
     return pipeline
 
-def get_or_load_ai_brain():
-    if os.path.exists(MODEL_FILE):
+def train_all_ai_brains():
+    for sym, config in PAIRS.items():
+        train_and_save_ai_brain_for_pair(sym, config["model_file"])
+
+def get_or_load_ai_brain(symbol):
+    model_file = PAIRS[symbol]["model_file"]
+    if os.path.exists(model_file):
         try:
-            return joblib.load(MODEL_FILE)
+            return joblib.load(model_file)
         except Exception as e:
-            print(f"[AI LOAD ERROR] {e}")
-    return train_and_save_ai_brain()
+            print(f"[AI LOAD ERROR {symbol}] {e}")
+    return train_and_save_ai_brain_for_pair(symbol, model_file)
 
 # =========================================================
 # 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN & TRAILING)
@@ -437,9 +460,9 @@ def update_dynamic_risk_management(current_price):
     memory = load_memory()
     pos = memory.get("open_position")
 
-    # જો ડેલ્ટા પર પોઝિશન ક્લોઝ થઈ ગઈ હોય તો મેમરી ક્લિયર કરો
     if not active_pos and pos is not None and not DRY_RUN:
-        print("[RISK CONTROL] Position Delta par close thai gai che. Clearing memory...")
+        print("[RISK CONTROL] Position close thai gai che. Cleaning orders & memory...")
+        cancel_all_open_orders()
         memory["open_position"] = None
         save_memory(memory)
         return
@@ -454,13 +477,12 @@ def update_dynamic_risk_management(current_price):
     if r_unit <= 0:
         return
 
-    # 1.5R પ્રોફિટ પર બ્રેક-ઈવન લોક કરવું
     if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
         pos["sl"] = entry
-        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL updated to: {entry}")
+        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL: {entry}")
     elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
         pos["sl"] = entry
-        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL updated to: {entry}")
+        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL: {entry}")
 
     memory["open_position"] = pos
     save_memory(memory)
@@ -468,8 +490,8 @@ def update_dynamic_risk_management(current_price):
 # =========================================================
 # 8. POSITION SIZING
 # =========================================================
-def calculate_contracts(balance, leverage, entry_price):
-    specs = get_product_specs()
+def calculate_contracts(symbol, balance, leverage, entry_price):
+    specs = get_product_specs(symbol)
     contract_val = specs["contract_value"]
     if balance <= 0 or entry_price <= 0:
         return 0
@@ -481,9 +503,9 @@ def calculate_contracts(balance, leverage, entry_price):
     return max(1, int(notional / contract_notional))
 
 # =========================================================
-# 9. PREDICTION ENGINE (CLOSED CANDLE ONLY)
+# 9. PREDICTION ENGINE WITH DYNAMIC CONFIDENCE CALIBRATION
 # =========================================================
-def predict_signal(df):
+def predict_signal(symbol, df):
     if df is None or len(df) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
@@ -492,22 +514,20 @@ def predict_signal(df):
     if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
-    # [મહત્વનો સુધારો]: અધૂરી કેન્ડલ નહીં પણ છેલ્લી પૂરી થયેલી કેન્ડલ [-2] વાપરો
     completed_candle = df_clean.iloc[-2]
     chop = float(completed_candle["chop_index"])
     adx = float(completed_candle["adx"])
 
-    # ચોપી અને સાઈડવેઝ માર્કેટ ફિલ્ટર
+    # ચોપી માર્કેટ રેજીમ ફિલ્ટર
     if chop > 61.8 and adx < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
 
-    # Whale Trap Scanner પણ પૂર્ણ કેન્ડલ્સ પર જ સ્કેન કરો
-    inst_signal = check_institutional_sweep(df_clean.iloc[:-1])
+    inst_signal = check_institutional_sweep(df_clean.iloc[:-1], symbol)
     if inst_signal:
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
 
-    pipeline = get_or_load_ai_brain()
+    pipeline = get_or_load_ai_brain(symbol)
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
 
@@ -522,139 +542,16 @@ def predict_signal(df):
         else:
             prob_down = float(prob)
 
-    memory = load_memory()
-    threshold = min(0.90, CONFIDENCE_BASE_THRESHOLD + memory.get("loss_penalty", 0.0))
+    # ૪ નંબર: ડાયનેમિક પ્રોબેબિલિટી કેલિબ્રેશન (વોલેટિલિટી મુજબ થ્રેશોલ્ડ 0.60 થી 0.70 સેટ થશે)
     current_atr = float(completed_candle["atr"])
     latest_close = float(completed_candle["close"])
-    funding_rate = fetch_funding_rate()
+    norm_atr = current_atr / (latest_close + 1e-9)
 
-    if prob_up >= threshold and funding_rate < 0.035:
-        action = "BUY"
-        conf = prob_up
-    elif prob_down >= threshold and funding_rate > -0.035:
-        action = "SELL"
-        conf = prob_down
-    else:
-        return ("HOLD", max(prob_up, prob_down), 0.0, 0.0, 0, "AI_WAIT_AND_SEE")
+    dynamic_confidence = CONFIDENCE_BASE_THRESHOLD
+    if norm_atr > 0.008:  # ઊંચી વોલેટિલિટીમાં કડક ફિલ્ટર
+        dynamic_confidence = 0.68
+    elif norm_atr > 0.005:
+        dynamic_confidence = 0.64
 
-    leverage = 5 if conf >= 0.78 else (4 if conf >= 0.68 else (3 if conf >= 0.60 else 2))
-    leverage = min(leverage, MAX_LEVERAGE)
-
-    tick_size = get_product_specs()["tick_size"]
-    sl_dist = current_atr * 1.2
-    tp_dist = current_atr * 2.8
-
-    if action == "BUY":
-        sl = round_to_tick(latest_close - sl_dist, tick_size)
-        tp = round_to_tick(latest_close + tp_dist, tick_size)
-    else:
-        sl = round_to_tick(latest_close + sl_dist, tick_size)
-        tp = round_to_tick(latest_close - tp_dist, tick_size)
-
-    return (action, conf, sl, tp, leverage, f"AI_BRAIN (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})")
-
-# =========================================================
-# 10. ORDER EXECUTION
-# =========================================================
-def place_order_with_brackets(action, size, stop_loss, take_profit):
-    if DRY_RUN:
-        return {"status": "DRY_RUN_SUCCESS", "message": "Dry run active. No real order placed."}
-    try:
-        path = "/v2/orders"
-        payload = {
-            "product_id": PRODUCT_ID,
-            "size": int(size),
-            "side": "buy" if action == "BUY" else "sell",
-            "order_type": "market_order",
-            "stop_loss_price": str(stop_loss),
-            "take_profit_price": str(take_profit)
-        }
-        payload_str = json.dumps(payload)
-        headers = get_headers("POST", path, payload=payload_str)
-        res = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=10)
-        return res.json()
-    except Exception as e:
-        print(f"[ORDER ERROR] {e}")
-        return {"error": str(e)}
-
-# =========================================================
-# 11. FLASK ROUTES & SCHEDULER
-# =========================================================
-@app.route("/", methods=["GET"])
-@app.route("/execute-trade", methods=["GET"])
-def execute_trade():
-    df = fetch_market_data()
-    latest_close = float(df["close"].iloc[-1]) if df is not None and not df.empty else 0.0
-
-    if latest_close > 0:
-        update_dynamic_risk_management(latest_close)
-
-    # ૧. ઓપન પોઝિશન તપાસો (જો ટ્રેડ ચાલુ હોય તો નવો ઓર્ડર બ્લોક કરવો)
-    active_position = get_live_position()
-    if active_position:
-        return jsonify({
-            "status": "POSITION_ALREADY_OPEN",
-            "message": "Trade already active. Skipping new orders to avoid over-leverage.",
-            "current_price": latest_close
-        }), 200
-
-    action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
-    balance = get_available_balance()
-    funding = fetch_funding_rate()
-
-    if action in ["BUY", "SELL"]:
-        contracts = calculate_contracts(balance, leverage, latest_close)
-        if balance <= 0 and not DRY_RUN:
-            return jsonify({
-                "status": "FAILED_NO_BALANCE",
-                "strategy": strategy_tag,
-                "action": action,
-                "confidence": f"{conf*100:.2f}%",
-                "balance": f"₹{balance:.2f}"
-            }), 200
-
-        order_res = place_order_with_brackets(action, contracts, sl, tp)
-
-        memory = load_memory()
-        memory["open_position"] = {
-            "side": action,
-            "entry": latest_close,
-            "sl": sl,
-            "tp": tp,
-            "contracts": contracts,
-            "time": int(time.time())
-        }
-        memory["total_trades"] = memory.get("total_trades", 0) + 1
-        save_memory(memory)
-
-        return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "action": action,
-            "confidence": f"{conf*100:.2f}%",
-            "contracts": contracts,
-            "leverage": f"{leverage}x",
-            "entry": latest_close,
-            "stop_loss": sl,
-            "take_profit": tp,
-            "funding_rate": f"{funding*100:.4f}%",
-            "strategy": strategy_tag,
-            "delta_response": order_res
-        }), 200
-
-    return jsonify({
-        "status": "WAIT_AND_SEE",
-        "action": "HOLD",
-        "confidence": f"{conf*100:.2f}%",
-        "funding_rate": f"{funding*100:.4f}%",
-        "strategy": strategy_tag,
-        "balance": f"₹{balance:.2f}"
-    }), 200
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=train_and_save_ai_brain, trigger="cron", day_of_week="sun", hour=0, minute=0)
-scheduler.start()
-
-if __name__ == "__main__":
-    if not os.path.exists(MODEL_FILE):
-        train_and_save_ai_brain()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    memory = load_memory()
+    threshold = min(0.90, dynamic_confidence + memory.get("loss_penal
