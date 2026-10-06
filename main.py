@@ -18,8 +18,6 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from telegram_alerts import send_telegram_alert
-
 app = Flask(__name__)
 
 # =========================================================
@@ -370,8 +368,7 @@ def add_indicators(df):
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
     df["target"] = np.where(df["close"].shift(-1) > df["close"], 1, 0)
     return df
-
-# =========================================================
+    # =========================================================
 # 5. WHALE-TRAP SCANNER
 # =========================================================
 def check_institutional_sweep(df, symbol):
@@ -399,7 +396,8 @@ def check_institutional_sweep(df, symbol):
             return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
 
     return None
-    # =========================================================
+
+# =========================================================
 # 6. AI BRAIN PIPELINE & AUTO RE-TRAINING (WALK-FORWARD)
 # =========================================================
 def build_ai_pipeline():
@@ -415,7 +413,7 @@ def build_ai_pipeline():
     ])
 
 def train_and_save_ai_brain_for_pair(symbol, model_file):
-    print(f"\n[{datetime.now()}] [AI] Starting Walk-Forward Retraining ({symbol})...")
+    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che ({symbol})...")
     df = fetch_market_data(symbol, limit_candles=1500)
     if df is None or len(df) < 100:
         return None
@@ -431,20 +429,12 @@ def train_and_save_ai_brain_for_pair(symbol, model_file):
     pipeline = build_ai_pipeline()
     pipeline.fit(X, y)
     joblib.dump(pipeline, model_file)
-    print(f"[{datetime.now()}] [AI] Model saved: {model_file} with {len(X)} samples")
+    print(f"[{datetime.now()}] [AI] Model save thai gayu: {model_file} with {len(X)} samples")
     return pipeline
 
 def train_all_ai_brains():
-    send_telegram_alert(
-        "🧠 *AI Retraining Triggered*\n"
-        "Weekly dynamic walk-forward learning started for all pairs."
-    )
     for sym, config in PAIRS.items():
         train_and_save_ai_brain_for_pair(sym, config["model_file"])
-    send_telegram_alert(
-        "✅ *AI Retraining Completed*\n"
-        "Models updated and deployed successfully."
-    )
 
 def get_or_load_ai_brain(symbol):
     model_file = PAIRS[symbol]["model_file"]
@@ -464,7 +454,7 @@ def update_dynamic_risk_management(current_price):
     pos = memory.get("open_position")
 
     if not active_pos and pos is not None and not DRY_RUN:
-        print("[RISK CONTROL] Position closed. Cleaning orders and memory...")
+        print("[RISK CONTROL] Position close thai gai che. Cleaning orders & memory...")
         cancel_all_open_orders()
         memory["open_position"] = None
         save_memory(memory)
@@ -480,28 +470,12 @@ def update_dynamic_risk_management(current_price):
     if r_unit <= 0:
         return
 
-    symbol = pos.get("symbol", "ACTIVE_PAIR")
-
     if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
         pos["sl"] = entry
         print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL: {entry}")
-        send_telegram_alert(
-            f"🛡️ *Break-Even Activated (Risk-Free Mode)*\n\n"
-            f"• *Symbol:* `{symbol}`\n"
-            f"• *Side:* `BUY`\n"
-            f"• *Target Move:* `1.5R Achieved`\n"
-            f"• *Updated SL:* `${entry:,.2f}`"
-        )
     elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
         pos["sl"] = entry
         print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL: {entry}")
-        send_telegram_alert(
-            f"🛡️ *Break-Even Activated (Risk-Free Mode)*\n\n"
-            f"• *Symbol:* `{symbol}`\n"
-            f"• *Side:* `SELL`\n"
-            f"• *Target Move:* `1.5R Achieved`\n"
-            f"• *Updated SL:* `${entry:,.2f}`"
-        )
 
     memory["open_position"] = pos
     save_memory(memory)
@@ -679,7 +653,7 @@ def execute_trade():
                 "symbol": sym,
                 "strategy": best_candidate["strategy_tag"],
                 "action": act,
-                "balance": f"{balance:.2f}"
+                "balance": f"₹{balance:.2f}"
             }), 200
 
         order_res = place_order_with_brackets(sym, act, contracts, best_candidate["sl"], best_candidate["tp"])
@@ -696,20 +670,6 @@ def execute_trade():
         }
         memory["total_trades"] = memory.get("total_trades", 0) + 1
         save_memory(memory)
-
-        trade_mode = "SIMULATED" if DRY_RUN else "REAL MONEY"
-        send_telegram_alert(
-            f"🚀 *New Trade Executed ({trade_mode})*\n\n"
-            f"• *Symbol:* `{sym}`\n"
-            f"• *Side:* `{act}`\n"
-            f"• *Contracts:* `{contracts}`\n"
-            f"• *Leverage:* `{best_candidate['leverage']}x`\n"
-            f"• *Entry Price:* `${best_candidate['latest_close']:,.2f}`\n"
-            f"• *Hard Stop-Loss:* `${best_candidate['sl']:,.2f}`\n"
-            f"• *Take-Profit:* `${best_candidate['tp']:,.2f}`\n"
-            f"• *Confidence:* `{best_candidate['conf']*100:.2f}%`\n"
-            f"• *Strategy:* `{best_candidate['strategy_tag']}`"
-        )
 
         return jsonify({
             "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
@@ -730,51 +690,29 @@ def execute_trade():
         "action": "HOLD",
         "scanned_pairs": list(PAIRS.keys()),
         "message": "No strong trend signals found on BTC or ETH. Staying safe.",
-        "balance": f"{balance:.2f}"
+        "balance": f"₹{balance:.2f}"
     }), 200
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=train_all_ai_brains, trigger="cron", day_of_week="sun", hour=0, minute=0)
 scheduler.start()
+
 # =========================================================
-# BACKGROUND BOT STARTUP & FAST PORT BINDING
+# BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
 # =========================================================
-def delayed_bot_startup():
-    time.sleep(5)
-    mode = "DRY RUN (Simulation)" if DRY_RUN else "LIVE TRADING (Delta Live)"
-    send_telegram_alert(
-        f"🤖 *Delta AI Trading Engine Online*\n\n"
-        f"• *Status:* `{mode}`\n"
-        f"• *Risk Limits:* `5% Margin Rule Active`\n"
-        f"• *Pairs:* `{', '.join(PAIRS.keys())}`\n"
-        f"• *Timestamp:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-    )
-    for sym, conf in PAIRS.items():
-        if not os.path.exists(conf["model_file"]):
-            try:
-                train_and_save_ai_brain_for_pair(sym, conf["model_file"])
-            except Exception as err:
-                print(f"[BACKGROUND TRAIN ERROR] {err}")
-
-def start_background_bot():
-    try:
-        startup_thread = threading.Thread(
-            target=delayed_bot_startup,
-            daemon=True
-        )
-        startup_thread.start()
-        print("[STARTUP] Background bot thread started.")
-    except Exception as e:
-        print(f"[STARTUP THREAD ERROR] {e}")
-
-
-# Start background bot
-start_background_bot()
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    def init_background_training():
+        time.sleep(2)
+        for sym, conf in PAIRS.items():
+            if not os.path.exists(conf["model_file"]):
+                try:
+                    train_and_save_ai_brain_for_pair(sym, conf["model_file"])
+                except Exception as err:
+                    print(f"[BACKGROUND TRAIN ERROR] {err}")
+
+    thread = threading.Thread(target=init_background_training, daemon=True)
+    thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+                    
