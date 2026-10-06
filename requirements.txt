@@ -1,8 +1,7 @@
-Flask
-gunicorn
+flask
 requests
+joblib
 numpy
 pandas
 scikit-learn
-joblib
-APScheduler
+apscheduler
