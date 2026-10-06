@@ -715,4 +715,31 @@ startup_thread.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    # =========================================================
+# 12. INSTANT BIND & AUTOMATIC BACKGROUND BOT LAUNCH
+# =========================================================
+def run_heavy_ai_engine():
+    # Render ને પોર્ટ કન્ફર્મ કરવા માટે 5 સેકન્ડનો સમય આપો
+    time.sleep(5)
+    print("\n[AI ENGINE] Render Port Secured. Starting background scanner & scheduler...")
     
+    # AI Brain તાલીમ અને શિડ્યુલર બેકગ્રાઉન્ડમાં શરૂ કરો
+    try:
+        init_background_training()
+    except Exception as e:
+        print(f"[BACKGROUND INIT ERROR] {e}")
+
+    try:
+        scheduler.start()
+        print("[SCHEDULER] Periodic retrain scheduler active.")
+    except Exception as e:
+        print(f"[SCHEDULER ERROR] {e}")
+
+# એપ લોડ થતાં જ બેકગ્રાઉન્ડ થ્રેડ આપોઆપ ફાયર થશે
+threading.Thread(target=run_heavy_ai_engine, daemon=True).start()
+
+if __name__ == "__main__":
+    # Render દ્વારા અપાતો dynamic PORT આપોઆપ લિસ્ટન થશે
+    server_port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=server_port)
+        
