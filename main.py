@@ -5,6 +5,7 @@ import hashlib
 import json
 import requests
 import joblib
+import threading
 
 from datetime import datetime
 from flask import Flask, jsonify
@@ -366,8 +367,7 @@ def add_indicators(df):
     df["recent_low"] = df["low"].shift(1).rolling(20).min()
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
     df["target"] = np.where(df["close"].shift(-1) > df["close"], 1, 0)
-    return df
-
+    return df 
 # =========================================================
 # 5. WHALE-TRAP SCANNER
 # =========================================================
@@ -560,4 +560,158 @@ def predict_signal(symbol, df):
     leverage = 5 if conf >= 0.78 else (4 if conf >= 0.68 else (3 if conf >= 0.60 else 2))
     leverage = min(leverage, MAX_LEVERAGE)
 
-    tick_size = get_pr
+    tick_size = get_product_specs(symbol)["tick_size"]
+    sl_dist = current_atr * 1.2
+    tp_dist = current_atr * 2.8
+
+    if action == "BUY":
+        sl = round_to_tick(latest_close - sl_dist, tick_size)
+        tp = round_to_tick(latest_close + tp_dist, tick_size)
+    else:
+        sl = round_to_tick(latest_close + sl_dist, tick_size)
+        tp = round_to_tick(latest_close - tp_dist, tick_size)
+
+    return (action, conf, sl, tp, leverage, f"AI_BRAIN_{symbol} (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})")
+
+# =========================================================
+# 10. ORDER EXECUTION
+# =========================================================
+def place_order_with_brackets(symbol, action, size, stop_loss, take_profit):
+    if DRY_RUN:
+        return {"status": "DRY_RUN_SUCCESS", "message": "Dry run active. No real order placed."}
+    try:
+        product_id = PAIRS[symbol]["product_id"]
+        path = "/v2/orders"
+        payload = {
+            "product_id": product_id,
+            "size": int(size),
+            "side": "buy" if action == "BUY" else "sell",
+            "order_type": "market_order",
+            "stop_loss_price": str(stop_loss),
+            "take_profit_price": str(take_profit)
+        }
+        payload_str = json.dumps(payload)
+        headers = get_headers("POST", path, payload=payload_str)
+        res = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=10)
+        return res.json()
+    except Exception as e:
+        print(f"[ORDER ERROR {symbol}] {e}")
+        return {"error": str(e)}
+
+# =========================================================
+# 11. FLASK ROUTES & MULTI-PAIR SCANNER SCHEDULER
+# =========================================================
+@app.route("/", methods=["GET"])
+@app.route("/execute-trade", methods=["GET"])
+def execute_trade():
+    active_position = get_live_position()
+    
+    if active_position:
+        symbol = active_position.get("product_symbol", "BTCUSD")
+        df_active = fetch_market_data(symbol, limit_candles=50)
+        latest_price = float(df_active["close"].iloc[-1]) if df_active is not None else 0.0
+        if latest_price > 0:
+            update_dynamic_risk_management(latest_price)
+        return jsonify({
+            "status": "POSITION_ALREADY_OPEN",
+            "active_symbol": symbol,
+            "message": "Trade already active. Skipping new orders to avoid duplicate executions."
+        }), 200
+
+    best_candidate = None
+    balance = get_available_balance()
+
+    for sym, config in PAIRS.items():
+        df = fetch_market_data(sym, limit_candles=200)
+        if df is None or df.empty:
+            continue
+            
+        action, conf, sl, tp, leverage, strategy_tag = predict_signal(sym, df)
+        latest_close = float(df["close"].iloc[-1])
+
+        if action in ["BUY", "SELL"]:
+            if best_candidate is None or conf > best_candidate["conf"]:
+                best_candidate = {
+                    "symbol": sym,
+                    "action": action,
+                    "conf": conf,
+                    "sl": sl,
+                    "tp": tp,
+                    "leverage": leverage,
+                    "strategy_tag": strategy_tag,
+                    "latest_close": latest_close
+                }
+
+    if best_candidate:
+        sym = best_candidate["symbol"]
+        act = best_candidate["action"]
+        contracts = calculate_contracts(sym, balance, best_candidate["leverage"], best_candidate["latest_close"])
+
+        if balance <= 0 and not DRY_RUN:
+            return jsonify({
+                "status": "FAILED_NO_BALANCE",
+                "symbol": sym,
+                "strategy": best_candidate["strategy_tag"],
+                "action": act,
+                "balance": f"₹{balance:.2f}"
+            }), 200
+
+        order_res = place_order_with_brackets(sym, act, contracts, best_candidate["sl"], best_candidate["tp"])
+
+        memory = load_memory()
+        memory["open_position"] = {
+            "symbol": sym,
+            "side": act,
+            "entry": best_candidate["latest_close"],
+            "sl": best_candidate["sl"],
+            "tp": best_candidate["tp"],
+            "contracts": contracts,
+            "time": int(time.time())
+        }
+        memory["total_trades"] = memory.get("total_trades", 0) + 1
+        save_memory(memory)
+
+        return jsonify({
+            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
+            "symbol": sym,
+            "action": act,
+            "confidence": f"{best_candidate['conf']*100:.2f}%",
+            "contracts": contracts,
+            "leverage": f"{best_candidate['leverage']}x",
+            "entry": best_candidate["latest_close"],
+            "stop_loss": best_candidate["sl"],
+            "take_profit": best_candidate["tp"],
+            "strategy": best_candidate["strategy_tag"],
+            "delta_response": order_res
+        }), 200
+
+    return jsonify({
+        "status": "WAIT_AND_SEE",
+        "action": "HOLD",
+        "scanned_pairs": list(PAIRS.keys()),
+        "message": "No strong trend signals found on BTC or ETH. Staying safe.",
+        "balance": f"₹{balance:.2f}"
+    }), 200
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=train_all_ai_brains, trigger="cron", day_of_week="sun", hour=0, minute=0)
+scheduler.start()
+
+# =========================================================
+# BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
+# =========================================================
+if __name__ == "__main__":
+    def init_background_training():
+        time.sleep(2)
+        for sym, conf in PAIRS.items():
+            if not os.path.exists(conf["model_file"]):
+                try:
+                    train_and_save_ai_brain_for_pair(sym, conf["model_file"])
+                except Exception as err:
+                    print(f"[BACKGROUND TRAIN ERROR] {err}")
+
+    thread = threading.Thread(target=init_background_training, daemon=True)
+    thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
