@@ -740,29 +740,29 @@ scheduler.start()
 # =========================================================
 # BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
 # =========================================================
+def delayed_bot_startup():
+    # Render ને પોર્ટ પકડવા માટે 10 સેકન્ડ આપો
+    time.sleep(10)
+    mode = "DRY RUN (Simulation)" if DRY_RUN else "LIVE TRADING (Delta Live)"
+    send_telegram_alert(
+        f"🤖 *Delta AI Trading Engine Online*\n\n"
+        f"• *Status:* `{mode}`\n"
+        f"• *Risk Limits:* `5% Margin Rule Active`\n"
+        f"• *Pairs:* `{', '.join(PAIRS.keys())}`\n"
+        f"• *Timestamp:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+    )
+    for sym, conf in PAIRS.items():
+        if not os.path.exists(conf["model_file"]):
+            try:
+                train_and_save_ai_brain_for_pair(sym, conf["model_file"])
+            except Exception as err:
+                print(f"[BACKGROUND TRAIN ERROR] {err}")
+
+# સર્વર ચાલુ થતાં જ બેકગ્રાઉન્ડ થ્રેડ ઉપડી જશે
+startup_thread = threading.Thread(target=delayed_bot_startup, daemon=True)
+startup_thread.start()
+
 if __name__ == "__main__":
-    def init_background_training():
-        time.sleep(2)
-        mode = "DRY RUN (Simulation)" if DRY_RUN else "LIVE TRADING (Delta Live)"
-        send_telegram_alert(
-            f"🤖 *Delta AI Trading Engine Online*\n\n"
-            f"• *Status:* `{mode}`\n"
-            f"• *Risk Limits:* `5% Margin Rule Active`\n"
-            f"• *Protections:* `Bracket Orders + Break-Even Enabled`\n"
-            f"• *Pairs:* `{', '.join(PAIRS.keys())}`\n"
-            f"• *Timestamp:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-        )
-
-        for sym, conf in PAIRS.items():
-            if not os.path.exists(conf["model_file"]):
-                try:
-                    train_and_save_ai_brain_for_pair(sym, conf["model_file"])
-                except Exception as err:
-                    print(f"[BACKGROUND TRAIN ERROR] {err}")
-
-    thread = threading.Thread(target=init_background_training, daemon=True)
-    thread.start()
-
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
     
