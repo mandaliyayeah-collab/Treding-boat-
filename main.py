@@ -736,13 +736,11 @@ def execute_trade():
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=train_all_ai_brains, trigger="cron", day_of_week="sun", hour=0, minute=0)
 scheduler.start()
-
 # =========================================================
-# BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
+# BACKGROUND BOT STARTUP & FAST PORT BINDING
 # =========================================================
 def delayed_bot_startup():
-    # Render ને પોર્ટ પકડવા માટે 10 સેકન્ડ આપો
-    time.sleep(10)
+    time.sleep(5)
     mode = "DRY RUN (Simulation)" if DRY_RUN else "LIVE TRADING (Delta Live)"
     send_telegram_alert(
         f"🤖 *Delta AI Trading Engine Online*\n\n"
@@ -758,7 +756,6 @@ def delayed_bot_startup():
             except Exception as err:
                 print(f"[BACKGROUND TRAIN ERROR] {err}")
 
-# સર્વર ચાલુ થતાં જ બેકગ્રાઉન્ડ થ્રેડ ઉપડી જશે
 startup_thread = threading.Thread(target=delayed_bot_startup, daemon=True)
 startup_thread.start()
 
