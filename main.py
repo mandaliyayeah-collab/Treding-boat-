@@ -700,19 +700,19 @@ scheduler.start()
 # =========================================================
 # BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
 # =========================================================
+def init_background_training():
+    time.sleep(10)
+    for sym, conf in PAIRS.items():
+        if not os.path.exists(conf["model_file"]):
+            try:
+                train_and_save_ai_brain_for_pair(sym, conf["model_file"])
+            except Exception as err:
+                print(f"[BACKGROUND TRAIN ERROR] {err}")
+
+startup_thread = threading.Thread(target=init_background_training, daemon=True)
+startup_thread.start()
+
 if __name__ == "__main__":
-    def init_background_training():
-        time.sleep(2)
-        for sym, conf in PAIRS.items():
-            if not os.path.exists(conf["model_file"]):
-                try:
-                    train_and_save_ai_brain_for_pair(sym, conf["model_file"])
-                except Exception as err:
-                    print(f"[BACKGROUND TRAIN ERROR] {err}")
-
-    thread = threading.Thread(target=init_background_training, daemon=True)
-    thread.start()
-
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-                    
+    
