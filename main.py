@@ -30,7 +30,6 @@ SYMBOL = "BTCUSD"
 PRODUCT_ID = 27
 
 MODEL_FILE = "ai_brain_model_v2.pkl"
-
 MEMORY_FILE = "trade_memory.json"
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
@@ -140,9 +139,11 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 # =========================================================
-# 3. WALLET BALANCE & MARKET DATA
+# 3. WALLET, POSITIONS & MARKET DATA
 # =========================================================
 def get_available_balance():
+    if DRY_RUN:
+        return 100000.0  # ટેસ્ટિંગ માટે ₹1,00,000 સિમ્યુલેટેડ બેલેન્સ
     try:
         path = "/v2/wallet/balances"
         headers = get_headers("GET", path)
@@ -161,6 +162,26 @@ def get_available_balance():
         print(f"[BALANCE ERROR] {e}")
         return 0.0
 
+def get_live_position():
+    """ડેલ્ટા એક્સચેન્જ પર લાઈવ ઓપન પોઝિશન ચેક કરે છે"""
+    if DRY_RUN:
+        memory = load_memory()
+        return memory.get("open_position")
+    try:
+        path = f"/v2/positions?product_id={PRODUCT_ID}"
+        headers = get_headers("GET", path)
+        res = requests.get(BASE_URL + path, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("success") and data.get("result"):
+            pos = data.get("result")
+            size = float(pos.get("size", 0))
+            if abs(size) > 0:
+                return pos
+        return None
+    except Exception as e:
+        print(f"[LIVE POSITION FETCH ERROR] {e}")
+        return None
+
 def fetch_market_data():
     try:
         now = int(time.time())
@@ -170,17 +191,14 @@ def fetch_market_data():
         base_urls = []
         if BASE_URL:
             base_urls.append(BASE_URL.rstrip("/"))
-
         india_url = "https://api.india.delta.exchange"
         if india_url not in base_urls:
             base_urls.append(india_url)
-
         global_url = "https://api.delta.exchange"
         if global_url not in base_urls:
             base_urls.append(global_url)
 
         base_urls = list(dict.fromkeys(base_urls))
-
         candles = None
 
         for base in base_urls:
@@ -191,7 +209,6 @@ def fetch_market_data():
                 "start": start_time,
                 "end": now
             }
-
             try:
                 response = requests.get(
                     url,
@@ -202,14 +219,11 @@ def fetch_market_data():
                         "User-Agent": "TradingBot/1.0"
                     }
                 )
-
                 if response.status_code != 200:
                     continue
-
                 data = response.json()
                 if data.get("success") is False:
                     continue
-
                 candles = data.get("result")
                 if candles and isinstance(candles, list) and len(candles) > 0:
                     break
@@ -243,7 +257,6 @@ def fetch_market_data():
 
         df = df.reset_index(drop=True)
         return df
-
     except Exception as e:
         print(f"[FETCH ERROR] {e}")
         return None
@@ -322,7 +335,7 @@ def add_indicators(df):
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
 
-    # --- ADX ---
+    # ADX
     up = df["high"] - df["high"].shift(1)
     down = df["low"].shift(1) - df["low"]
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
@@ -333,7 +346,7 @@ def add_indicators(df):
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
     df["adx"] = dx.rolling(14).mean()
 
-    # --- Choppiness Index ---
+    # Choppiness Index
     sum_tr = tr.rolling(14).sum()
     max_h = df["high"].rolling(14).max()
     min_l = df["low"].rolling(14).min()
@@ -417,11 +430,20 @@ def get_or_load_ai_brain():
     return train_and_save_ai_brain()
 
 # =========================================================
-# 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN TRAILING)
+# 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN & TRAILING)
 # =========================================================
 def update_dynamic_risk_management(current_price):
+    active_pos = get_live_position()
     memory = load_memory()
     pos = memory.get("open_position")
+
+    # જો ડેલ્ટા પર પોઝિશન ક્લોઝ થઈ ગઈ હોય તો મેમરી ક્લિયર કરો
+    if not active_pos and pos is not None and not DRY_RUN:
+        print("[RISK CONTROL] Position Delta par close thai gai che. Clearing memory...")
+        memory["open_position"] = None
+        save_memory(memory)
+        return
+
     if not pos:
         return
 
@@ -432,12 +454,13 @@ def update_dynamic_risk_management(current_price):
     if r_unit <= 0:
         return
 
+    # 1.5R પ્રોફિટ પર બ્રેક-ઈવન લોક કરવું
     if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
         pos["sl"] = entry
-        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL set to: {entry}")
+        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL updated to: {entry}")
     elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
         pos["sl"] = entry
-        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL set to: {entry}")
+        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL updated to: {entry}")
 
     memory["open_position"] = pos
     save_memory(memory)
@@ -458,7 +481,7 @@ def calculate_contracts(balance, leverage, entry_price):
     return max(1, int(notional / contract_notional))
 
 # =========================================================
-# 9. PREDICTION ENGINE
+# 9. PREDICTION ENGINE (CLOSED CANDLE ONLY)
 # =========================================================
 def predict_signal(df):
     if df is None or len(df) < 30:
@@ -469,13 +492,17 @@ def predict_signal(df):
     if len(df_clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
-    latest = df_clean.iloc[-1]
-    chop = float(latest["chop_index"])
-    adx = float(latest["adx"])
+    # [મહત્વનો સુધારો]: અધૂરી કેન્ડલ નહીં પણ છેલ્લી પૂરી થયેલી કેન્ડલ [-2] વાપરો
+    completed_candle = df_clean.iloc[-2]
+    chop = float(completed_candle["chop_index"])
+    adx = float(completed_candle["adx"])
+
+    # ચોપી અને સાઈડવેઝ માર્કેટ ફિલ્ટર
     if chop > 61.8 and adx < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
 
-    inst_signal = check_institutional_sweep(df_clean)
+    # Whale Trap Scanner પણ પૂર્ણ કેન્ડલ્સ પર જ સ્કેન કરો
+    inst_signal = check_institutional_sweep(df_clean.iloc[:-1])
     if inst_signal:
         action, conf, sl, tp, tag = inst_signal
         return (action, conf, sl, tp, 4, tag)
@@ -484,7 +511,7 @@ def predict_signal(df):
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
 
-    latest_features = df_clean[FEATURES].iloc[[-1]]
+    latest_features = df_clean[FEATURES].iloc[[-2]]
     probabilities = pipeline.predict_proba(latest_features)[0]
     classes = pipeline.named_steps["model"].classes_
 
@@ -497,8 +524,8 @@ def predict_signal(df):
 
     memory = load_memory()
     threshold = min(0.90, CONFIDENCE_BASE_THRESHOLD + memory.get("loss_penalty", 0.0))
-    current_atr = float(df_clean["atr"].iloc[-1])
-    latest_close = float(df_clean["close"].iloc[-1])
+    current_atr = float(completed_candle["atr"])
+    latest_close = float(completed_candle["close"])
     funding_rate = fetch_funding_rate()
 
     if prob_up >= threshold and funding_rate < 0.035:
@@ -550,7 +577,7 @@ def place_order_with_brackets(action, size, stop_loss, take_profit):
         print(f"[ORDER ERROR] {e}")
         return {"error": str(e)}
 
-        # =========================================================
+# =========================================================
 # 11. FLASK ROUTES & SCHEDULER
 # =========================================================
 @app.route("/", methods=["GET"])
@@ -561,6 +588,15 @@ def execute_trade():
 
     if latest_close > 0:
         update_dynamic_risk_management(latest_close)
+
+    # ૧. ઓપન પોઝિશન તપાસો (જો ટ્રેડ ચાલુ હોય તો નવો ઓર્ડર બ્લોક કરવો)
+    active_position = get_live_position()
+    if active_position:
+        return jsonify({
+            "status": "POSITION_ALREADY_OPEN",
+            "message": "Trade already active. Skipping new orders to avoid over-leverage.",
+            "current_price": latest_close
+        }), 200
 
     action, conf, sl, tp, leverage, strategy_tag = predict_signal(df)
     balance = get_available_balance()
@@ -584,8 +620,11 @@ def execute_trade():
             "side": action,
             "entry": latest_close,
             "sl": sl,
-            "tp": tp
+            "tp": tp,
+            "contracts": contracts,
+            "time": int(time.time())
         }
+        memory["total_trades"] = memory.get("total_trades", 0) + 1
         save_memory(memory)
 
         return jsonify({
@@ -619,4 +658,3 @@ if __name__ == "__main__":
     if not os.path.exists(MODEL_FILE):
         train_and_save_ai_brain()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    
