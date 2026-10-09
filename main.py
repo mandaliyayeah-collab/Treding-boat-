@@ -3,16 +3,15 @@ import time
 import hmac
 import hashlib
 import json
+import secrets
+import threading
+from datetime import datetime
+
 import requests
 import joblib
-import threading
-
-from datetime import datetime
-from flask import Flask, jsonify
-
 import numpy as np
 import pandas as pd
-
+from flask import Flask, jsonify, request
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
@@ -21,40 +20,37 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 
 # =========================================================
-# CONFIGURATION & MULTI-PAIR SETUP
+# CONFIGURATION
 # =========================================================
-BASE_URL = os.environ.get("DELTA_BASE_URL", "https://api.india.delta.exchange")
+BASE_URL = os.environ.get(
+    "DELTA_BASE_URL", "https://api.india.delta.exchange"
+).rstrip("/")
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 
 PAIRS = {
-    "BTCUSD": {"product_id": 27, "model_file": "ai_brain_btc_v2.pkl"},
-    "ETHUSD": {"product_id": 29, "model_file": "ai_brain_eth_v2.pkl"}
+    "BTCUSD": {"model_file": "ai_brain_btc_v2.pkl"},
+    "ETHUSD": {"model_file": "ai_brain_eth_v2.pkl"},
 }
 
-MEMORY_FILE = "trade_memory.json"
-
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+MEMORY_FILE = os.environ.get("MEMORY_FILE", "trade_memory.json")
+# Live orders require BOTH DRY_RUN=false and ENABLE_LIVE_TRADING=YES.
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+ENABLE_LIVE_TRADING = os.environ.get("ENABLE_LIVE_TRADING", "").strip().upper() == "YES"
+BOT_TRIGGER_TOKEN = os.environ.get("BOT_TRIGGER_TOKEN", "")
+MAX_BUDGET_INR = float(os.environ.get("MAX_BUDGET_INR", "1000"))
+MARGIN_ALLOCATION_PERCENT = float(os.environ.get("MARGIN_ALLOCATION_PERCENT", "0.05"))
 CONFIDENCE_BASE_THRESHOLD = 0.60
-MARGIN_ALLOCATION_PERCENT = 0.05
-MAX_LEVERAGE = 5
+MAX_LEVERAGE = 3
 
 FEATURES = [
-    "return",
-    "ma7",
-    "ma25",
-    "volume",
-    "atr",
-    "rsi",
-    "lower_wick_ratio",
-    "upper_wick_ratio",
-    "vol_surge",
-    "norm_atr",
-    "wick_skew",
-    "dist_ma25",
-    "adx",
-    "chop_index"
+    "return", "ma7", "ma25", "volume", "atr", "rsi",
+    "lower_wick_ratio", "upper_wick_ratio", "vol_surge",
+    "norm_atr", "wick_skew", "dist_ma25", "adx", "chop_index"
 ]
+
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+training_lock = threading.Lock()
 
 # =========================================================
 # AUTHENTICATION
@@ -69,21 +65,25 @@ def generate_signature(secret, method, path, query="", payload=""):
     ).hexdigest()
     return signature, timestamp
 
+
 def get_headers(method, path, query="", payload=""):
     if not API_KEY or not API_SECRET:
         raise RuntimeError("Delta API credentials are missing.")
-    signature, timestamp = generate_signature(API_SECRET, method, path, query, payload)
+    signature, timestamp = generate_signature(
+        API_SECRET, method, path, query, payload
+    )
     return {
         "api-key": API_KEY,
         "signature": signature,
         "timestamp": timestamp,
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "Crypto-AI-Trading-Bot/2.0"
+        "User-Agent": "Crypto-AI-Trading-Bot/2.0",
     }
 
+
 # =========================================================
-# 1. MEMORY ENGINE
+# MEMORY
 # =========================================================
 def default_memory():
     return {
@@ -91,137 +91,147 @@ def default_memory():
         "total_trades": 0,
         "losses": 0,
         "wins": 0,
-        "open_position": None
+        "open_position": None,
     }
+
 
 def load_memory():
     if not os.path.exists(MEMORY_FILE):
         return default_memory()
     try:
-        with open(MEMORY_FILE, "r") as f:
-            base = default_memory()
-            base.update(json.load(f))
-            return base
-    except Exception as e:
-        print(f"[MEMORY ERROR] {e}")
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            memory = default_memory()
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                memory.update(loaded)
+            return memory
+    except Exception as exc:
+        print(f"[MEMORY ERROR] {exc}")
         return default_memory()
+
 
 def save_memory(data):
     try:
-        with open(MEMORY_FILE, "w") as f:
+        temp_file = MEMORY_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"[MEMORY SAVE ERROR] {e}")
+        os.replace(temp_file, MEMORY_FILE)
+    except Exception as exc:
+        print(f"[MEMORY SAVE ERROR] {exc}")
+
 
 # =========================================================
-# 2. PRODUCT SPECS & TICK ROUNDING
+# PRODUCT SPECS
 # =========================================================
 def get_product_specs(symbol):
-    endpoints = [
-        f"{BASE_URL}/v2/products/{symbol}",
-        f"https://api.delta.exchange/v2/products/{symbol}"
-    ]
-    default_vals = {"BTCUSD": {"val": 0.001, "tick": 0.5}, "ETHUSD": {"val": 0.01, "tick": 0.05}}
-    for url in endpoints:
-        try:
-            res = requests.get(url, timeout=5, headers={"Accept": "application/json"})
-            data = res.json()
-            if data.get("success") and data.get("result"):
-                product = data.get("result")
-                return {
-                    "contract_value": float(product.get("contract_value", default_vals.get(symbol, {}).get("val", 0.001))),
-                    "tick_size": float(product.get("tick_size", default_vals.get(symbol, {}).get("tick", 0.5)))
-                }
-        except Exception:
-            continue
-    fallback = default_vals.get(symbol, {"val": 0.001, "tick": 0.5})
-    return {"contract_value": fallback["val"], "tick_size": fallback["tick"]}
+    """Fetch live product metadata. Never guess product IDs or contract values."""
+    url = f"{BASE_URL}/v2/products/{symbol}"
+    response = requests.get(url, timeout=10, headers={"Accept": "application/json"})
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("success") or not isinstance(data.get("result"), dict):
+        raise RuntimeError(f"Could not retrieve Delta product metadata for {symbol}: {data}")
+    product = data["result"]
+    product_id = product.get("id")
+    contract_value = product.get("contract_value")
+    tick_size = product.get("tick_size")
+    if product_id is None or contract_value in (None, "", 0, "0") or tick_size in (None, "", 0, "0"):
+        raise RuntimeError(f"Incomplete product metadata for {symbol}; refusing to trade.")
+    return {
+        "product_id": int(product_id),
+        "contract_value": float(contract_value),
+        "tick_size": float(tick_size),
+        "symbol": str(product.get("symbol", symbol)),
+        "state": str(product.get("state", "")).lower(),
+    }
+
 
 def round_to_tick(price, tick_size):
     if tick_size <= 0:
         return float(price)
-    return round(round(price / tick_size) * tick_size, 8)
+    return round(round(float(price) / tick_size) * tick_size, 8)
 
-# ==============================================================================
-# 3. WALLET, POSITIONS & MARKET DATA
-# ==============================================================================
 
+# =========================================================
+# WALLET / POSITIONS
+# =========================================================
 def get_available_balance():
     if DRY_RUN:
-        return 100000.0
+        return MAX_BUDGET_INR
     try:
         path = "/v2/wallet/balances"
-        headers = get_headers("GET", path)
-        res = requests.get(BASE_URL + path, headers=headers)
-        data = res.json()
+        response = requests.get(BASE_URL + path, headers=get_headers("GET", path), timeout=10)
+        response.raise_for_status()
+        data = response.json()
         if not data.get("success"):
+            print(f"[BALANCE API ERROR] {data}")
             return 0.0
-
+        # Budget is INR; never treat USD/USDT quantities as INR without conversion.
         for item in data.get("result", []):
-            asset = str(item.get("asset_symbol", "")).upper()
-            if asset in ["INR", "USD", "USDT"]:
-                bal = float(item.get("available_balance") or item.get("balance") or 0.0)
-                if bal > 0:
-                    return bal
+            if str(item.get("asset_symbol", "")).upper() == "INR":
+                return max(0.0, float(item.get("available_balance") or item.get("balance") or 0.0))
+        print("[BALANCE] No INR wallet balance found; refusing to size orders.")
         return 0.0
-    except Exception as e:
-        print(f"[BALANCE ERROR] {e}")
+    except Exception as exc:
+        print(f"[BALANCE ERROR] {exc}")
         return 0.0
+
 
 def get_live_position():
     if DRY_RUN:
-        memory = load_memory()
-        return memory.get("open_position")
+        return load_memory().get("open_position")
     try:
         path = "/v2/positions"
-        headers = get_headers("GET", path)
-        res = requests.get(BASE_URL + path, headers=headers)
-        data = res.json()
-        if data.get("success") and data.get("result"):
-            for pos in data.get("result", []):
-                size = float(pos.get("size", 0.0))
-                if abs(size) > 0:
-                    return pos
+        response = requests.get(
+            BASE_URL + path,
+            headers=get_headers("GET", path),
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("success"):
+            for position in data.get("result", []) or []:
+                if abs(float(position.get("size", 0) or 0)) > 0:
+                    return position
         return None
-    except Exception as e:
-        print(f"[POSITION ERROR] {e}")
+    except Exception as exc:
+        print(f"[POSITION ERROR] {exc}")
         return None
-        
-    except Exception as e:
-        print(f"[LIVE POSITION FETCH ERROR] {e}")
-        return None
+
 
 def cancel_all_open_orders(product_id=None):
     if DRY_RUN:
         return
     try:
-        targets = [product_id] if product_id else [info["product_id"] for info in PAIRS.values()]
-        for pid in targets:
+        product_ids = (
+            [product_id]
+            if product_id is not None
+            else [get_product_specs(symbol)["product_id"] for symbol in PAIRS]
+        )
+        for pid in product_ids:
             path = "/v2/orders/all"
-            payload = json.dumps({"product_id": pid})
+            payload = json.dumps({"product_id": pid}, separators=(",", ":"))
             headers = get_headers("DELETE", path, payload=payload)
-            requests.delete(BASE_URL + path, headers=headers, data=payload, timeout=5)
-        print("[ORDER CLEANUP] All pending bracket orders cancelled.")
-    except Exception as e:
-        print(f"[CANCEL ALL ERROR] {e}")
+            response = requests.delete(
+                BASE_URL + path, headers=headers, data=payload, timeout=10
+            )
+            print(f"[ORDER CLEANUP] product_id={pid}, HTTP={response.status_code}")
+    except Exception as exc:
+        print(f"[CANCEL ALL ERROR] {exc}")
 
+
+# =========================================================
+# MARKET DATA
+# =========================================================
 def fetch_market_data(symbol, limit_candles=1500):
     try:
         now = int(time.time())
-        lookback_seconds = limit_candles * 15 * 60
-        start_time = now - lookback_seconds
-
-        base_urls = []
-        if BASE_URL:
-            base_urls.append(BASE_URL.rstrip("/"))
-        india_url = "https://api.india.delta.exchange"
-        if india_url not in base_urls:
-            base_urls.append(india_url)
-        global_url = "https://api.delta.exchange"
-        if global_url not in base_urls:
-            base_urls.append(global_url)
-
-        base_urls = list(dict.fromkeys(base_urls))
+        start_time = now - limit_candles * 15 * 60
+        base_urls = list(dict.fromkeys([
+            BASE_URL,
+            "https://api.india.delta.exchange",
+            "https://api.delta.exchange",
+        ]))
         candles = None
 
         for base in base_urls:
@@ -230,99 +240,86 @@ def fetch_market_data(symbol, limit_candles=1500):
                 "resolution": "15m",
                 "symbol": symbol,
                 "start": start_time,
-                "end": now
+                "end": now,
             }
             try:
                 response = requests.get(
                     url,
                     params=params,
                     timeout=15,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "TradingBot/2.0"
-                    }
+                    headers={"Accept": "application/json", "User-Agent": "TradingBot/2.0"},
                 )
                 if response.status_code != 200:
                     continue
                 data = response.json()
                 if data.get("success") is False:
                     continue
-                candles = data.get("result")
-                if candles and isinstance(candles, list) and len(candles) > 0:
+                result = data.get("result")
+                if isinstance(result, list) and result:
+                    candles = result
                     break
-            except Exception as e:
-                print(f"[API ATTEMPT ERROR {symbol}] {e}")
-                continue
+            except Exception as exc:
+                print(f"[API ATTEMPT ERROR {symbol}] {exc}")
 
         if not candles:
+            print(f"[FETCH ERROR {symbol}] No candle data returned.")
             return None
 
-        df = pd.DataFrame(candles)
-        rename_map = {"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
-        df = df.rename(columns=rename_map)
-
-        required_columns = ["open", "high", "low", "close", "volume"]
-        for col in required_columns:
-            if col not in df.columns:
+        df = pd.DataFrame(candles).rename(
+            columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+        )
+        required = ["open", "high", "low", "close", "volume"]
+        for column in required:
+            if column not in df.columns:
+                print(f"[FETCH ERROR {symbol}] Missing column: {column}")
                 return None
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[column] = pd.to_numeric(df[column], errors="coerce")
 
-        df = df.dropna(subset=required_columns).copy()
-
+        df = df.dropna(subset=required).copy()
         if "time" in df.columns:
             df["time"] = pd.to_numeric(df["time"], errors="coerce")
-            df = df.dropna(subset=["time"])
-            df = df.sort_values("time")
+            df = df.dropna(subset=["time"]).sort_values("time")
             df = df.drop_duplicates(subset=["time"], keep="last")
-
-        df = df.reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f"[FETCH ERROR {symbol}] {e}")
+        return df.reset_index(drop=True)
+    except Exception as exc:
+        print(f"[FETCH ERROR {symbol}] {exc}")
         return None
 
+
 def fetch_funding_rate(symbol):
-    endpoints = [
-        f"{BASE_URL}/v2/tickers/{symbol}",
-        f"https://api.india.delta.exchange/v2/tickers/{symbol}",
-        f"https://api.delta.exchange/v2/tickers/{symbol}"
-    ]
-    for url in endpoints:
+    for base in dict.fromkeys([BASE_URL, "https://api.india.delta.exchange", "https://api.delta.exchange"]):
         try:
-            res = requests.get(url, timeout=5)
-            data = res.json()
+            response = requests.get(f"{base}/v2/tickers/{symbol}", timeout=5)
+            data = response.json()
             if data.get("success"):
-                return float(data.get("result", {}).get("funding_rate", 0.0))
+                result = data.get("result", {})
+                return float(result.get("funding_rate", 0.0) or 0.0)
         except Exception:
             continue
     return 0.0
 
+
 def fetch_order_book_metrics(symbol):
-    endpoints = [
-        f"{BASE_URL}/v2/l2orderbook/{symbol}",
-        f"https://api.india.delta.exchange/v2/l2orderbook/{symbol}",
-        f"https://api.delta.exchange/v2/l2orderbook/{symbol}"
-    ]
-    for url in endpoints:
+    for base in dict.fromkeys([BASE_URL, "https://api.india.delta.exchange", "https://api.delta.exchange"]):
         try:
-            res = requests.get(url, timeout=5)
-            data = res.json()
+            response = requests.get(f"{base}/v2/l2orderbook/{symbol}", timeout=5)
+            data = response.json()
             if data.get("success"):
                 book = data.get("result", {})
                 bids = book.get("buy", [])
                 asks = book.get("sell", [])
                 if bids and asks:
-                    top_bids = sum(float(x.get("size", 0)) for x in bids[:10])
-                    top_asks = sum(float(x.get("size", 0)) for x in asks[:10])
-                    total = top_bids + top_asks + 1e-9
-                    obi = (top_bids - top_asks) / total
-                    return obi, top_bids, top_asks
+                    bid_size = sum(float(item.get("size", 0) or 0) for item in bids[:10])
+                    ask_size = sum(float(item.get("size", 0) or 0) for item in asks[:10])
+                    total = bid_size + ask_size + 1e-9
+                    return (bid_size - ask_size) / total, bid_size, ask_size
         except Exception:
             continue
     return 0.0, 0.0, 0.0
 
+
 # =========================================================
-# 4. QUANT INDICATORS
+# INDICATORS
 # =========================================================
 def add_indicators(df):
     df = df.copy()
@@ -337,8 +334,8 @@ def add_indicators(df):
     df["atr"] = tr.rolling(14).mean()
 
     delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / (loss + 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
@@ -348,9 +345,8 @@ def add_indicators(df):
     df["lower_wick_ratio"] = (body_low - df["low"]) / candle_range
     df["upper_wick_ratio"] = (df["high"] - body_high) / candle_range
 
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["vol_surge"] = df["volume"] / (df["vol_ma20"] + 1e-9)
-
+    vol_ma20 = df["volume"].rolling(20).mean()
+    df["vol_surge"] = df["volume"] / (vol_ma20 + 1e-9)
     df["norm_atr"] = df["atr"] / (df["close"] + 1e-9)
     df["wick_skew"] = df["lower_wick_ratio"] - df["upper_wick_ratio"]
     df["dist_ma25"] = (df["close"] - df["ma25"]) / (df["ma25"] + 1e-9)
@@ -360,22 +356,25 @@ def add_indicators(df):
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
     tr_smooth = tr.rolling(14).sum()
-    plus_di = 100 * (plus_dm.rolling(14).sum() / (tr_smooth + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(14).sum() / (tr_smooth + 1e-9))
-    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
+    plus_di = 100 * plus_dm.rolling(14).sum() / (tr_smooth + 1e-9)
+    minus_di = 100 * minus_dm.rolling(14).sum() / (tr_smooth + 1e-9)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
     df["adx"] = dx.rolling(14).mean()
 
     sum_tr = tr.rolling(14).sum()
     max_h = df["high"].rolling(14).max()
     min_l = df["low"].rolling(14).min()
-    df["chop_index"] = 100 * (np.log10(sum_tr / (max_h - min_l + 1e-9)) / np.log10(14))
+    ratio = sum_tr / (max_h - min_l + 1e-9)
+    df["chop_index"] = 100 * (np.log10(ratio.clip(lower=1e-9)) / np.log10(14))
 
     df["recent_low"] = df["low"].shift(1).rolling(20).min()
     df["recent_high"] = df["high"].shift(1).rolling(20).max()
-    df["target"] = np.where(df["close"].shift(-1) > df["close"], 1, 0)
+    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
     return df
-      # =========================================================
-# 5. WHALE-TRAP SCANNER
+
+
+# =========================================================
+# WHALE-TRAP SCANNER
 # =========================================================
 def check_institutional_sweep(df, symbol):
     if len(df) < 30:
@@ -389,22 +388,35 @@ def check_institutional_sweep(df, symbol):
     funding_rate = fetch_funding_rate(symbol)
     tick_size = get_product_specs(symbol)["tick_size"]
 
-    if latest["low"] < latest["recent_low"] and latest["close"] > latest["recent_low"]:
-        if obi_ratio > 0.35 and latest["lower_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20 and funding_rate < 0.04:
-            sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
-            tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
-            return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
+    if (
+        latest["low"] < latest["recent_low"]
+        and latest["close"] > latest["recent_low"]
+        and obi_ratio > 0.35
+        and latest["lower_wick_ratio"] >= 0.40
+        and latest["vol_surge"] >= 1.20
+        and funding_rate < 0.04
+    ):
+        sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
+        tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
+        return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
 
-    if latest["high"] > latest["recent_high"] and latest["close"] < latest["recent_high"]:
-        if obi_ratio < -0.35 and latest["upper_wick_ratio"] >= 0.40 and latest["vol_surge"] >= 1.20 and funding_rate > -0.04:
-            sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
-            tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
-            return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
+    if (
+        latest["high"] > latest["recent_high"]
+        and latest["close"] < latest["recent_high"]
+        and obi_ratio < -0.35
+        and latest["upper_wick_ratio"] >= 0.40
+        and latest["vol_surge"] >= 1.20
+        and funding_rate > -0.04
+    ):
+        sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
+        tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
+        return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
 
     return None
 
+
 # =========================================================
-# 6. AI BRAIN PIPELINE & AUTO RE-TRAINING (WALK-FORWARD)
+# AI TRAINING
 # =========================================================
 def build_ai_pipeline():
     return Pipeline([
@@ -414,135 +426,164 @@ def build_ai_pipeline():
             learning_rate=0.06,
             max_depth=3,
             subsample=0.85,
-            random_state=42
-        ))
+            random_state=42,
+        )),
     ])
 
+
 def train_and_save_ai_brain_for_pair(symbol, model_file):
-    print(f"\n[{datetime.now()}] [AI] Auto Re-training sharu thay che ({symbol})...")
-    df = fetch_market_data(symbol, limit_candles=1500)
-    if df is None or len(df) < 100:
+    if not training_lock.acquire(blocking=False):
+        print(f"[AI] Training already running; skipping {symbol}.")
         return None
+    try:
+        print(f"[{datetime.now()}] [AI] Training started for {symbol}")
+        df = fetch_market_data(symbol, limit_candles=1500)
+        if df is None or len(df) < 150:
+            print(f"[AI] Not enough candle data for {symbol}.")
+            return None
 
-    df = add_indicators(df)
-    df_clean = df.dropna(subset=FEATURES + ["target"]).copy()
-    if len(df_clean) < 80:
+        df = add_indicators(df)
+        clean = df.dropna(subset=FEATURES + ["target"]).copy()
+        if len(clean) < 80:
+            print(f"[AI] Not enough clean training rows for {symbol}.")
+            return None
+
+        # Last row has no known future outcome; exclude it from training.
+        X = clean[FEATURES].iloc[:-1]
+        y = clean["target"].iloc[:-1]
+        if y.nunique() < 2:
+            print(f"[AI] Training labels contain only one class for {symbol}.")
+            return None
+
+        pipeline = build_ai_pipeline()
+        pipeline.fit(X, y)
+        joblib.dump(pipeline, model_file)
+        print(f"[AI] Saved {model_file}; samples={len(X)}")
+        return pipeline
+    except Exception as exc:
+        print(f"[AI TRAIN ERROR {symbol}] {exc}")
         return None
+    finally:
+        training_lock.release()
 
-    X = df_clean[FEATURES][:-1]
-    y = df_clean["target"][:-1]
-
-    pipeline = build_ai_pipeline()
-    pipeline.fit(X, y)
-    joblib.dump(pipeline, model_file)
-    print(f"[{datetime.now()}] [AI] Model save thai gayu: {model_file} with {len(X)} samples")
-    return pipeline
 
 def train_all_ai_brains():
-    for sym, config in PAIRS.items():
-        train_and_save_ai_brain_for_pair(sym, config["model_file"])
+    for symbol, config in PAIRS.items():
+        train_and_save_ai_brain_for_pair(symbol, config["model_file"])
+
 
 def get_or_load_ai_brain(symbol):
     model_file = PAIRS[symbol]["model_file"]
     if os.path.exists(model_file):
         try:
             return joblib.load(model_file)
-        except Exception as e:
-            print(f"[AI LOAD ERROR {symbol}] {e}")
+        except Exception as exc:
+            print(f"[AI LOAD ERROR {symbol}] {exc}")
     return train_and_save_ai_brain_for_pair(symbol, model_file)
 
+
 # =========================================================
-# 7. DYNAMIC RISK MANAGEMENT (BREAK-EVEN & TRAILING)
+# RISK MANAGEMENT
 # =========================================================
 def update_dynamic_risk_management(current_price):
-    active_pos = get_live_position()
+    active_position = get_live_position()
     memory = load_memory()
-    pos = memory.get("open_position")
+    position = memory.get("open_position")
 
-    if not active_pos and pos is not None and not DRY_RUN:
-        print("[RISK CONTROL] Position close thai gai che. Cleaning orders & memory...")
+    if not active_position and position is not None and not DRY_RUN:
+        print("[RISK CONTROL] Live position closed; clearing memory.")
         cancel_all_open_orders()
         memory["open_position"] = None
         save_memory(memory)
         return
 
-    if not pos:
+    if not position:
         return
 
-    side = pos.get("side")
-    entry = float(pos.get("entry", 0))
-    sl = float(pos.get("sl", 0))
-    r_unit = abs(entry - sl)
-    if r_unit <= 0:
+    side = position.get("side")
+    entry = float(position.get("entry", 0) or 0)
+    stop_loss = float(position.get("sl", 0) or 0)
+    risk_unit = abs(entry - stop_loss)
+    if entry <= 0 or risk_unit <= 0:
         return
 
-    if side == "BUY" and current_price >= entry + (1.5 * r_unit) and sl < entry:
-        pos["sl"] = entry
-        print(f"[RISK CONTROL] BUY Trade Break-Even Triggered! SL: {entry}")
-    elif side == "SELL" and current_price <= entry - (1.5 * r_unit) and sl > entry:
-        pos["sl"] = entry
-        print(f"[RISK CONTROL] SELL Trade Break-Even Triggered! SL: {entry}")
+    if side == "BUY" and current_price >= entry + 1.5 * risk_unit and stop_loss < entry:
+        position["sl"] = entry
+        print(f"[RISK CONTROL] BUY break-even SL={entry}")
+    elif side == "SELL" and current_price <= entry - 1.5 * risk_unit and stop_loss > entry:
+        position["sl"] = entry
+        print(f"[RISK CONTROL] SELL break-even SL={entry}")
 
-    memory["open_position"] = pos
+    memory["open_position"] = position
     save_memory(memory)
 
-# =========================================================
-# 8. POSITION SIZING
-# =========================================================
-def calculate_contracts(symbol, balance, leverage, entry_price):
-    specs = get_product_specs(symbol)
-    contract_val = specs["contract_value"]
-    if balance <= 0 or entry_price <= 0:
-        return 0
-    margin = balance * MARGIN_ALLOCATION_PERCENT
-    notional = margin * leverage
-    contract_notional = entry_price * contract_val
-    if contract_notional <= 0:
-        return 0
-    return max(1, int(notional / contract_notional))
 
 # =========================================================
-# 9. PREDICTION ENGINE WITH DYNAMIC CONFIDENCE CALIBRATION
+# POSITION SIZING
+# =========================================================
+def calculate_contracts(symbol, balance, leverage, entry_price):
+    """Conservative sizing; return 0 rather than forcing an unaffordable contract."""
+    try:
+        specs = get_product_specs(symbol)
+        contract_value = specs["contract_value"]
+        if balance <= 0 or entry_price <= 0 or contract_value <= 0:
+            return 0
+        capped_balance = min(float(balance), MAX_BUDGET_INR)
+        margin = capped_balance * MARGIN_ALLOCATION_PERCENT
+        notional = margin * min(int(leverage), MAX_LEVERAGE)
+        contract_notional = entry_price * contract_value
+        if contract_notional <= 0:
+            return 0
+        return max(0, int(notional / contract_notional))
+    except Exception as exc:
+        print(f"[SIZING ERROR {symbol}] {exc}")
+        return 0
+        # =========================================================
+# PREDICTION ENGINE
 # =========================================================
 def predict_signal(symbol, df):
     if df is None or len(df) < 30:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_DATA")
 
     df = add_indicators(df)
-    df_clean = df.dropna(subset=FEATURES).copy()
-    if len(df_clean) < 20:
+    clean = df.dropna(subset=FEATURES).copy()
+    if len(clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
-    completed_candle = df_clean.iloc[-2]
-    chop = float(completed_candle["chop_index"])
-    adx = float(completed_candle["adx"])
-
+    # Use the last completed candle, not the potentially still-forming candle.
+    candle = clean.iloc[-2]
+    chop = float(candle["chop_index"])
+    adx = float(candle["adx"])
     if chop > 61.8 and adx < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
 
-    inst_signal = check_institutional_sweep(df_clean.iloc[:-1], symbol)
-    if inst_signal:
-        action, conf, sl, tp, tag = inst_signal
-        return (action, conf, sl, tp, 4, tag)
+    institutional_signal = check_institutional_sweep(clean.iloc[:-1], symbol)
+    if institutional_signal:
+        action, confidence, sl, tp, tag = institutional_signal
+        return (action, confidence, sl, tp, 4, tag)
 
     pipeline = get_or_load_ai_brain(symbol)
     if pipeline is None:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "AI_TRAIN_FAIL")
 
-    latest_features = df_clean[FEATURES].iloc[[-2]]
-    probabilities = pipeline.predict_proba(latest_features)[0]
-    classes = pipeline.named_steps["model"].classes_
+    try:
+        features = clean[FEATURES].iloc[[-2]]
+        probabilities = pipeline.predict_proba(features)[0]
+        classes = pipeline.named_steps["model"].classes_
+    except Exception as exc:
+        print(f"[PREDICTION ERROR {symbol}] {exc}")
+        return ("HOLD", 0.0, 0.0, 0.0, 0, "PREDICTION_ERROR")
 
     prob_up, prob_down = 0.0, 0.0
-    for cls, prob in zip(classes, probabilities):
-        if int(cls) == 1:
-            prob_up = float(prob)
+    for class_label, probability in zip(classes, probabilities):
+        if int(class_label) == 1:
+            prob_up = float(probability)
         else:
-            prob_down = float(prob)
+            prob_down = float(probability)
 
-    current_atr = float(completed_candle["atr"])
-    latest_close = float(completed_candle["close"])
-    norm_atr = current_atr / (latest_close + 1e-9)
+    atr = float(candle["atr"])
+    close = float(candle["close"])
+    norm_atr = atr / (close + 1e-9)
 
     dynamic_confidence = CONFIDENCE_BASE_THRESHOLD
     if norm_atr > 0.008:
@@ -551,225 +592,256 @@ def predict_signal(symbol, df):
         dynamic_confidence = 0.64
 
     memory = load_memory()
-    threshold = min(0.90, dynamic_confidence + memory.get("loss_penalty", 0.0))
+    threshold = min(0.90, dynamic_confidence + float(memory.get("loss_penalty", 0.0)))
     funding_rate = fetch_funding_rate(symbol)
 
     if prob_up >= threshold and funding_rate < 0.035:
-        action = "BUY"
-        conf = prob_up
+        action, confidence = "BUY", prob_up
     elif prob_down >= threshold and funding_rate > -0.035:
-        action = "SELL"
-        conf = prob_down
+        action, confidence = "SELL", prob_down
     else:
-        return ("HOLD", max(prob_up, prob_down), 0.0, 0.0, 0, f"AI_WAIT (REQ:{threshold:.2f})")
+        return (
+            "HOLD", max(prob_up, prob_down), 0.0, 0.0, 0,
+            f"AI_WAIT (REQ:{threshold:.2f})"
+        )
 
-    leverage = 5 if conf >= 0.78 else (4 if conf >= 0.68 else (3 if conf >= 0.60 else 2))
+    leverage = 5 if confidence >= 0.78 else (
+        4 if confidence >= 0.68 else (
+            3 if confidence >= 0.60 else 2
+        )
+    )
     leverage = min(leverage, MAX_LEVERAGE)
 
     tick_size = get_product_specs(symbol)["tick_size"]
-    sl_dist = current_atr * 1.2
-    tp_dist = current_atr * 2.8
+    sl_distance = atr * 1.2
+    tp_distance = atr * 2.8
 
     if action == "BUY":
-        sl = round_to_tick(latest_close - sl_dist, tick_size)
-        tp = round_to_tick(latest_close + tp_dist, tick_size)
+        sl = round_to_tick(close - sl_distance, tick_size)
+        tp = round_to_tick(close + tp_distance, tick_size)
     else:
-        sl = round_to_tick(latest_close + sl_dist, tick_size)
-        tp = round_to_tick(latest_close - tp_dist, tick_size)
+        sl = round_to_tick(close + sl_distance, tick_size)
+        tp = round_to_tick(close - tp_distance, tick_size)
 
-    return (action, conf, sl, tp, leverage, f"AI_BRAIN_{symbol} (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})")
+    return (
+        action, confidence, sl, tp, leverage,
+        f"AI_BRAIN_{symbol} (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})"
+    )
+
 
 # =========================================================
-# 10. ORDER EXECUTION
+# ORDER EXECUTION
 # =========================================================
 def place_order_with_brackets(symbol, action, size, stop_loss, take_profit):
     if DRY_RUN:
-        return {"status": "DRY_RUN_SUCCESS", "message": "Dry run active. No real order placed."}
+        return {"success": True, "status": "DRY_RUN_SUCCESS", "message": "No real order placed."}
+    if not ENABLE_LIVE_TRADING:
+        return {"success": False, "error": "Live trading blocked. Set ENABLE_LIVE_TRADING=YES explicitly."}
+    if size <= 0:
+        return {"success": False, "error": "Invalid order size."}
     try:
-        product_id = PAIRS[symbol]["product_id"]
+        specs = get_product_specs(symbol)
+        if specs["state"] not in ("", "live", "active", "open"):
+            return {"success": False, "error": f"Product {symbol} is not active (state={specs['state']})."}
         path = "/v2/orders"
         payload = {
-            "product_id": product_id,
+            "product_id": specs["product_id"],
             "size": int(size),
             "side": "buy" if action == "BUY" else "sell",
             "order_type": "market_order",
-            "stop_loss_price": str(stop_loss),
-            "take_profit_price": str(take_profit)
+            "bracket_stop_loss_price": str(stop_loss),
+            "bracket_take_profit_price": str(take_profit),
+            "bracket_stop_trigger_method": "mark_price",
         }
-        payload_str = json.dumps(payload)
+        payload_str = json.dumps(payload, separators=(",", ":"))
         headers = get_headers("POST", path, payload=payload_str)
-        res = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=10)
-        return res.json()
-    except Exception as e:
-        print(f"[ORDER ERROR {symbol}] {e}")
-        return {"error": str(e)}
+        response = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=15)
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"success": False, "error": f"Non-JSON response (HTTP {response.status_code})"}
+        if response.status_code >= 400 or not result.get("success"):
+            print(f"[ORDER API REJECTED {symbol}] HTTP={response.status_code}, response={result}")
+            return {"success": False, "http_status": response.status_code, "exchange_response": result}
+        return result
+    except Exception as exc:
+        print(f"[ORDER ERROR {symbol}] {exc}")
+        return {"success": False, "error": str(exc)}
+
 
 # =========================================================
-# 11. FLASK ROUTES & MULTI-PAIR SCANNER SCHEDULER
+# FLASK ROUTES
 # =========================================================
 @app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "service": "Crypto AI Trading Bot",
+        "dry_run": DRY_RUN,
+        "live_trading_enabled": ENABLE_LIVE_TRADING,
+        "max_budget_inr": MAX_BUDGET_INR,
+        "pairs": list(PAIRS.keys()),
+    }), 200
+
+
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
+    # Never expose an unauthenticated endpoint that can submit real orders.
+    if not BOT_TRIGGER_TOKEN:
+        return jsonify({"status": "TRIGGER_NOT_CONFIGURED", "message": "Set BOT_TRIGGER_TOKEN in environment variables."}), 503
+    supplied_token = request.headers.get("X-Bot-Token", "")
+    if not secrets.compare_digest(supplied_token, BOT_TRIGGER_TOKEN):
+        return jsonify({"status": "UNAUTHORIZED"}), 401
+
+    if not DRY_RUN and not ENABLE_LIVE_TRADING:
+        return jsonify({"status": "LIVE_TRADING_DISABLED", "message": "Set DRY_RUN=false and ENABLE_LIVE_TRADING=YES only after verifying account and settings."}), 403
+
     active_position = get_live_position()
-    
+
     if active_position:
-        symbol = active_position.get("product_symbol", "BTCUSD")
-        df_active = fetch_market_data(symbol, limit_candles=50)
-        latest_price = float(df_active["close"].iloc[-1]) if df_active is not None else 0.0
+        symbol = active_position.get("product_symbol", active_position.get("symbol", "BTCUSD"))
+        market_data = fetch_market_data(symbol, limit_candles=50)
+        latest_price = (
+            float(market_data["close"].iloc[-1])
+            if market_data is not None and not market_data.empty
+            else 0.0
+        )
         if latest_price > 0:
             update_dynamic_risk_management(latest_price)
         return jsonify({
             "status": "POSITION_ALREADY_OPEN",
             "active_symbol": symbol,
-            "message": "Trade already active. Skipping new orders to avoid duplicate executions."
+            "message": "Existing position found; skipping new orders.",
         }), 200
 
-    best_candidate = None
     balance = get_available_balance()
+    best_candidate = None
 
-    for sym, config in PAIRS.items():
-        df = fetch_market_data(sym, limit_candles=200)
-        if df is None or df.empty:
+    for symbol in PAIRS:
+        market_data = fetch_market_data(symbol, limit_candles=200)
+        if market_data is None or market_data.empty:
             continue
-            
-        action, conf, sl, tp, leverage, strategy_tag = predict_signal(sym, df)
-        latest_close = float(df["close"].iloc[-1])
 
-        if action in ["BUY", "SELL"]:
-            if best_candidate is None or conf > best_candidate["conf"]:
+        action, confidence, sl, tp, leverage, strategy = predict_signal(symbol, market_data)
+        latest_close = float(market_data["close"].iloc[-1])
+
+        if action in ("BUY", "SELL"):
+            if best_candidate is None or confidence > best_candidate["confidence"]:
                 best_candidate = {
-                    "symbol": sym,
+                    "symbol": symbol,
                     "action": action,
-                    "conf": conf,
+                    "confidence": confidence,
                     "sl": sl,
                     "tp": tp,
                     "leverage": leverage,
-                    "strategy_tag": strategy_tag,
-                    "latest_close": latest_close
+                    "strategy": strategy,
+                    "latest_close": latest_close,
                 }
 
     if best_candidate:
-        sym = best_candidate["symbol"]
-        act = best_candidate["action"]
-        contracts = calculate_contracts(sym, balance, best_candidate["leverage"], best_candidate["latest_close"])
+        symbol = best_candidate["symbol"]
+        action = best_candidate["action"]
 
         if balance <= 0 and not DRY_RUN:
             return jsonify({
                 "status": "FAILED_NO_BALANCE",
-                "symbol": sym,
-                "strategy": best_candidate["strategy_tag"],
-                "action": act,
-                "balance": f"₹{balance:.2f}"
+                "symbol": symbol,
+                "balance": balance,
             }), 200
 
-        order_res = place_order_with_brackets(sym, act, contracts, best_candidate["sl"], best_candidate["tp"])
+        if MAX_BUDGET_INR <= 0 or MARGIN_ALLOCATION_PERCENT <= 0 or MARGIN_ALLOCATION_PERCENT > 1:
+            return jsonify({"status": "FAILED_RISK_CONFIG", "message": "Check MAX_BUDGET_INR and MARGIN_ALLOCATION_PERCENT."}), 500
+
+        contracts = calculate_contracts(
+            symbol, balance, best_candidate["leverage"], best_candidate["latest_close"]
+        )
+        if contracts <= 0:
+            return jsonify({"status": "SKIPPED_BUDGET_TOO_SMALL", "symbol": symbol, "budget_inr": min(balance, MAX_BUDGET_INR), "message": "One contract does not fit this sizing calculation; no order placed."}), 200
+
+        order_result = place_order_with_brackets(
+            symbol, action, contracts, best_candidate["sl"], best_candidate["tp"]
+        )
+
+        # Do not record a live position if the exchange rejected the order.
+        if not DRY_RUN and order_result.get("success") is not True:
+            return jsonify({
+                "status": "ORDER_FAILED",
+                "symbol": symbol,
+                "exchange_response": order_result,
+            }), 502
 
         memory = load_memory()
         memory["open_position"] = {
-            "symbol": sym,
-            "side": act,
+            "symbol": symbol,
+            "side": action,
             "entry": best_candidate["latest_close"],
             "sl": best_candidate["sl"],
             "tp": best_candidate["tp"],
             "contracts": contracts,
-            "time": int(time.time())
+            "time": int(time.time()),
         }
         memory["total_trades"] = memory.get("total_trades", 0) + 1
         save_memory(memory)
 
         return jsonify({
-            "status": "ORDER_PLACED" if not DRY_RUN else "SIMULATED_ORDER",
-            "symbol": sym,
-            "action": act,
-            "confidence": f"{best_candidate['conf']*100:.2f}%",
+            "status": "SIMULATED_ORDER" if DRY_RUN else "ORDER_SUBMITTED",
+            "symbol": symbol,
+            "action": action,
+            "confidence": f"{best_candidate['confidence'] * 100:.2f}%",
             "contracts": contracts,
             "leverage": f"{best_candidate['leverage']}x",
             "entry": best_candidate["latest_close"],
             "stop_loss": best_candidate["sl"],
             "take_profit": best_candidate["tp"],
-            "strategy": best_candidate["strategy_tag"],
-            "delta_response": order_res
+            "strategy": best_candidate["strategy"],
+            "exchange_response": order_result,
         }), 200
 
     return jsonify({
         "status": "WAIT_AND_SEE",
         "action": "HOLD",
         "scanned_pairs": list(PAIRS.keys()),
-        "message": "No strong trend signals found on BTC or ETH. Staying safe.",
-        "balance": f"₹{balance:.2f}"
+        "message": "No qualifying signal found.",
+        "balance": balance,
     }), 200
 
-from apscheduler.schedulers.background import BackgroundScheduler
-
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-
-scheduler.add_job(
-    func=train_all_ai_brains,
-    trigger="cron",
-    day_of_week="sun",
-    hour=23,
-    minute=0,
-    id="train_all_ai_brains",
-    replace_existing=True,
-    max_instances=1,
-    coalesce=True
-)
-
-if not scheduler.running:
-    scheduler.start()
-    
 
 # =========================================================
-# BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
+# BACKGROUND TASKS / STARTUP
 # =========================================================
 def init_background_training():
+    # Small delay lets the web service finish booting first.
     time.sleep(15)
-    for sym, conf in PAIRS.items():
-        if not os.path.exists(conf["model_file"]):
-            try:
-                train_and_save_ai_brain_for_pair(sym, conf["model_file"])
-            except Exception as err:
-                print(f"[BACKGROUND TRAIN ERROR] {err}")
+    for symbol, config in PAIRS.items():
+        if not os.path.exists(config["model_file"]):
+            train_and_save_ai_brain_for_pair(symbol, config["model_file"])
 
-startup_thread = threading.Thread(
-    target=init_background_training,
-    name="ai-brain-startup",
-    daemon=True
-)
 
-if not startup_thread.is_alive():
-    startup_thread.start()
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-    # =========================================================
-# 12. INSTANT BIND & AUTOMATIC BACKGROUND BOT LAUNCH
-# =========================================================
-def run_heavy_ai_engine():
-    # Render ને પોર્ટ કન્ફર્મ કરવા માટે 5 સેકન્ડનો સમય આપો
-    time.sleep(5)
-    print("\n[AI ENGINE] Render Port Secured. Starting background scanner & scheduler...")
-    
-    # AI Brain તાલીમ અને શિડ્યુલર બેકગ્રાઉન્ડમાં શરૂ કરો
-    try:
-        init_background_training()
-    except Exception as e:
-        print(f"[BACKGROUND INIT ERROR] {e}")
-
-    try:
+def start_scheduler():
+    if not scheduler.get_job("train_all_ai_brains"):
+        scheduler.add_job(
+            func=train_all_ai_brains,
+            trigger="cron",
+            day_of_week="sun",
+            hour=23,
+            minute=0,
+            id="train_all_ai_brains",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     if not scheduler.running:
         scheduler.start()
         print("[SCHEDULER] Started successfully")
-    else:
-        print("[SCHEDULER] Already running")
-except Exception as e:
-    print(f"[SCHEDULER ERROR] {e}")
 
-# એપ લોડ થતાં જ બેકગ્રાઉન્ડ થ્રેડ આપોઆપ ફાયર થશે
-threading.Thread(target=run_heavy_ai_engine, daemon=True).start()
+
+# Enable background jobs explicitly; multiple web workers can duplicate schedulers.
+if os.environ.get("ENABLE_BACKGROUND_JOBS", "false").lower() == "true":
+    start_scheduler()
+    training_thread = threading.Thread(target=init_background_training, name="ai-brain-startup", daemon=True)
+    training_thread.start()
 
 if __name__ == "__main__":
-    # Render દ્વારા અપાતો dynamic PORT આપોઆપ લિસ્ટન થશે
-    server_port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=server_port)
-        
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
