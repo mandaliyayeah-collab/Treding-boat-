@@ -142,23 +142,25 @@ def round_to_tick(price, tick_size):
         return float(price)
     return round(round(price / tick_size) * tick_size, 8)
 
-# =========================================================
+# ==============================================================================
 # 3. WALLET, POSITIONS & MARKET DATA
-# =========================================================
+# ==============================================================================
+
 def get_available_balance():
     if DRY_RUN:
         return 100000.0
     try:
         path = "/v2/wallet/balances"
         headers = get_headers("GET", path)
-        res = requests.get(BASE_URL + path, headers=headers, timeout=10)
+        res = requests.get(BASE_URL + path, headers=headers)
         data = res.json()
         if not data.get("success"):
             return 0.0
-            
+
         for item in data.get("result", []):
-            if item.get("asset_symbol") in ["USD", "USDT", "INR"]:
-                bal = float(item.get("available_balance", 0.0))
+            asset = str(item.get("asset_symbol", "")).upper()
+            if asset in ["INR", "USD", "USDT"]:
+                bal = float(item.get("available_balance") or item.get("balance") or 0.0)
                 if bal > 0:
                     return bal
         return 0.0
@@ -173,14 +175,18 @@ def get_live_position():
     try:
         path = "/v2/positions"
         headers = get_headers("GET", path)
-        res = requests.get(BASE_URL + path, headers=headers, timeout=10)
+        res = requests.get(BASE_URL + path, headers=headers)
         data = res.json()
         if data.get("success") and data.get("result"):
             for pos in data.get("result", []):
-                size = float(pos.get("size", 0))
+                size = float(pos.get("size", 0.0))
                 if abs(size) > 0:
                     return pos
         return None
+    except Exception as e:
+        print(f"[POSITION ERROR] {e}")
+        return None
+        
     except Exception as e:
         print(f"[LIVE POSITION FETCH ERROR] {e}")
         return None
