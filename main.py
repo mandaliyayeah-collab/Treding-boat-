@@ -701,7 +701,9 @@ def execute_trade():
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=train_all_ai_brains, trigger="cron", day_of_week="sun", hour=0, minute=0)
-scheduler.start()
+if not scheduler.running:
+    scheduler.start()
+    
 
 # =========================================================
 # BACKGROUND THREAD TRAINING & INSTANT PORT OPENING
