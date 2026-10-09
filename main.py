@@ -699,17 +699,20 @@ def execute_trade():
         "balance": f"₹{balance:.2f}"
     }), 200
 
-scheduler = BackgroundScheduler(timezone="UTC")
+from apscheduler.schedulers.background import BackgroundScheduler
+
+scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 
 scheduler.add_job(
     func=train_all_ai_brains,
-    trigger="interval",
-    minutes=30,
+    trigger="cron",
+    day_of_week="sun",
+    hour=23,
+    minute=0,
     id="train_all_ai_brains",
     replace_existing=True,
     max_instances=1,
-    coalesce=True,
-    misfire_grace_time=60
+    coalesce=True
 )
 
 if not scheduler.running:
