@@ -731,9 +731,14 @@ def init_background_training():
             except Exception as err:
                 print(f"[BACKGROUND TRAIN ERROR] {err}")
 
-startup_thread = threading.Thread(target=init_background_training, daemon=True)
-startup_thread.start()
+startup_thread = threading.Thread(
+    target=init_background_training,
+    name="ai-brain-startup",
+    daemon=True
+)
 
+if not startup_thread.is_alive():
+    startup_thread.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
@@ -752,10 +757,13 @@ def run_heavy_ai_engine():
         print(f"[BACKGROUND INIT ERROR] {e}")
 
     try:
+    if not scheduler.running:
         scheduler.start()
-        print("[SCHEDULER] Periodic retrain scheduler active.")
-    except Exception as e:
-        print(f"[SCHEDULER ERROR] {e}")
+        print("[SCHEDULER] Started successfully")
+    else:
+        print("[SCHEDULER] Already running")
+except Exception as e:
+    print(f"[SCHEDULER ERROR] {e}")
 
 # એપ લોડ થતાં જ બેકગ્રાઉન્ડ થ્રેડ આપોઆપ ફાયર થશે
 threading.Thread(target=run_heavy_ai_engine, daemon=True).start()
