@@ -171,11 +171,22 @@ def get_available_balance():
         if not data.get("success"):
             print(f"[BALANCE API ERROR] {data}")
             return 0.0
-        # Budget is INR; never treat USD/USDT quantities as INR without conversion.
+
+        print(f"[RAW WALLET DATA] {data.get('result', [])}")
+
         for item in data.get("result", []):
-            if str(item.get("asset_symbol", "")).upper() == "INR":
-                return max(0.0, float(item.get("available_balance") or item.get("balance") or 0.0))
-        print("[BALANCE] No INR wallet balance found; refusing to size orders.")
+            symbol = str(item.get("asset_symbol", "")).upper()
+            if symbol in ["INR", "USD", "USDT"] or "INR" in symbol:
+                bal = float(item.get("available_balance") or item.get("balance") or 0.0)
+                if bal > 0:
+                    return bal
+
+        for item in data.get("result", []):
+            bal = float(item.get("available_balance") or item.get("balance") or 0.0)
+            if bal > 0:
+                return bal
+
+        print("[BALANCE] No active balance found in wallet.")
         return 0.0
     except Exception as exc:
         print(f"[BALANCE ERROR] {exc}")
