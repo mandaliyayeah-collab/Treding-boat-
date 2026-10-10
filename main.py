@@ -186,7 +186,7 @@ def get_live_position():
     if DRY_RUN:
         return load_memory().get("open_position")
     try:
-        path = "/v2/positions"
+        path = "/v2/positions/margined"
         response = requests.get(
             BASE_URL + path,
             headers=get_headers("GET", path),
