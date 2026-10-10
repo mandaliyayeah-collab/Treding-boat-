@@ -673,17 +673,24 @@ def place_order_with_brackets(symbol, action, size, stop_loss, take_profit):
     try:
         specs = get_product_specs(symbol)
         if specs["state"] not in ("", "live", "active", "open"):
-            return {"success": False, "error": f"Product {symbol} is not active (state={specs['state']})."}
+                        return {"success": False, "error": "Product not live"}
         path = "/v2/orders"
-        payload = {
+        sl_val = round_to_tick(float(stop_loss))
+        tp_val = round_to_tick(float(take_profit))
+
+         payload = {
             "product_id": specs["product_id"],
             "size": int(size),
             "side": "buy" if action == "BUY" else "sell",
             "order_type": "market_order",
-            "bracket_stop_loss_price": str(stop_loss),
-            "bracket_take_profit_price": str(take_profit),
-            "bracket_stop_trigger_method": "mark_price",
+            "bracket_stop_loss_price": f"{sl_val:.2f}" if specs.get("tick_size", "1") in ["0.01", "0.1", "0.5"] else str(sl_val),
+            "bracket_take_profit_price": f"{tp_val:.2f}" if specs.get("tick_size", "1") in ["0.01", "0.1", "0.5"] else str(tp_val),
+            "bracket_stop_trigger_method": "mark_price"
         }
+        
+        
+        
+        
         payload_str = json.dumps(payload, separators=(",", ":"))
         headers = get_headers("POST", path, payload=payload_str)
         response = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=15)
