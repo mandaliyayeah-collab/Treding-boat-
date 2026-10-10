@@ -24,9 +24,9 @@ app = Flask(__name__)
 # =========================================================
 BASE_URL = os.environ.get(
     "DELTA_BASE_URL", "https://api.india.delta.exchange"
-).rstrip("/")
-API_KEY = os.environ.get("DELTA_API_KEY", "")
-API_SECRET = os.environ.get("DELTA_API_SECRET", "")
+).strip().rstrip("/")
+API_KEY = os.environ.get("DELTA_API_KEY", "").strip()
+API_SECRET = os.environ.get("DELTA_API_SECRET", "").strip()
 
 PAIRS = {
     "BTCUSD": {"model_file": "ai_brain_btc_v2.pkl"},
