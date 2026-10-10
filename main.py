@@ -409,22 +409,26 @@ def check_institutional_sweep(df, symbol):
         and latest["vol_surge"] >= 1.20
         and funding_rate < 0.04
     ):
-        sl = round_to_tick(latest["low"] - 0.4 * atr, tick_size)
-        tp = round_to_tick(latest["close"] + 3.0 * atr, tick_size)
-        return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_BULLISH_SWEEP")
+                # BUY Logic: મિનિમમ 1% ($25+) નો મોટો ટાર્ગેટ અને 1:2.5 Risk-Reward
+        risk_dist = max(latest["close"] * 0.006, abs(latest["close"] - latest["low"]))
+        sl = round_to_tick(latest["close"] - risk_dist)
+        tp = round_to_tick(latest["close"] + (risk_dist * 2.5))
+        return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_SWEEP")
 
     if (
         latest["high"] > latest["recent_high"]
         and latest["close"] < latest["recent_high"]
         and obi_ratio < -0.35
-        and latest["upper_wick_ratio"] >= 0.40
+        and latest["upper_wick_ratio"] >= 0.30
         and latest["vol_surge"] >= 1.20
         and funding_rate > -0.04
     ):
-        sl = round_to_tick(latest["high"] + 0.4 * atr, tick_size)
-        tp = round_to_tick(latest["close"] - 3.0 * atr, tick_size)
-        return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_BEARISH_SWEEP")
-
+        # SELL Logic: મિનિમમ 1% ($25+) નો મોટો ટાર્ગેટ અને 1:2.5 Risk-Reward
+        risk_dist = max(latest["close"] * 0.006, abs(latest["high"] - latest["close"]))
+        sl = round_to_tick(latest["close"] + risk_dist)
+        tp = round_to_tick(latest["close"] - (risk_dist * 2.5))
+        return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_SWEEP")
+        
     return None
 
 
