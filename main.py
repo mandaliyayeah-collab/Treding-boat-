@@ -18,6 +18,11 @@ from sklearn.pipeline import Pipeline
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
+try:
+    current_ip = requests.get("https://api.ipify.org").text.strip()
+    print(f"===> RENDER OUTGOING IP: {current_ip}")
+except Exception as e:
+    print(f"Could not fetch IP: {e}")
 
 # =========================================================
 # CONFIGURATION
