@@ -175,15 +175,12 @@ def get_available_balance():
         print(f"[RAW WALLET DATA] {data.get('result', [])}")
 
         for item in data.get("result", []):
-            symbol = str(item.get("asset_symbol", "")).upper()
-            if symbol in ["INR", "USD", "USDT"] or "INR" in symbol:
-                bal = float(item.get("available_balance") or item.get("balance") or 0.0)
-                if bal > 0:
-                    return bal
-
-        for item in data.get("result", []):
             bal = float(item.get("available_balance") or item.get("balance") or 0.0)
             if bal > 0:
+                symbol = str(item.get("asset_symbol", "")).upper()
+                # Jo Delta USD/USDT value aape (jem ke 11.78), to INR ma badlo
+                if symbol in ["USD", "USDT"] or bal < 100.0:
+                    return bal * 85.0
                 return bal
 
         print("[BALANCE] No active balance found in wallet.")
