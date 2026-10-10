@@ -535,19 +535,33 @@ def update_dynamic_risk_management(current_price):
 # POSITION SIZING
 # =========================================================
 def calculate_contracts(symbol, balance, leverage, entry_price):
-    """Conservative sizing; return 0 rather than forcing an unaffordable contract."""
+    """Safe sizing calculation strictly bounded by available USD margin."""
     try:
         specs = get_product_specs(symbol)
-        contract_value = specs["contract_value"]
+        contract_value = float(specs.get("contract_value") or 0.0)
         if balance <= 0 or entry_price <= 0 or contract_value <= 0:
             return 0
-        capped_balance = min(float(balance), MAX_BUDGET_INR)
-        margin = capped_balance * MARGIN_ALLOCATION_PERCENT
-        notional = margin * min(int(leverage), MAX_LEVERAGE)
-        contract_notional = entry_price * contract_value
-        if contract_notional <= 0:
+
+        # Balance જો INR માં હોય (100 થી વધુ), તો તેને USD માં કન્વર્ટ કરો
+        balance_usd = (balance / 85.0) if balance > 100.0 else balance
+        
+        # સુરક્ષિત માર્જિન: વૉલેટના વધુમાં વધુ 70% માર્જિનનો ઉપયોગ કરવો
+        usable_margin = balance_usd * 0.70
+        eff_leverage = max(1, min(int(leverage or 5), int(MAX_LEVERAGE)))
+        
+        # 1 કોન્ટ્રાક્ટ માટે જરૂરી USD માર્જિન
+        margin_per_contract = (entry_price * contract_value) / eff_leverage
+        if margin_per_contract <= 0:
             return 0
-        return max(0, int(notional / contract_notional))
+
+        qty = int(usable_margin / margin_per_contract)
+        
+        # જો માર્જિન પૂરતું હોય તો ઓછામાં ઓછો 1 કોન્ટ્રાક્ટ પ્લેસ કરો
+        if qty == 0 and usable_margin >= margin_per_contract * 0.85:
+            qty = 1
+
+        print(f"[SIZING] {symbol} => Available USD: {balance_usd:.2f}, Margin/Contract: {margin_per_contract:.2f}, Final Qty: {qty}")
+        return max(0, qty)
     except Exception as exc:
         print(f"[SIZING ERROR {symbol}] {exc}")
         return 0
